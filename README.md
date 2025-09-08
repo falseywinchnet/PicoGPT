@@ -1,4 +1,4 @@
-#PicoGPT repository
+
 10.7M trainable parameters (tied head) are needed for nanogpt to produce:
 ```
 ANGELO:
