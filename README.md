@@ -1,6 +1,6 @@
 #PicoGPT repository
 10.7M trainable parameters (tied head) are needed for nanogpt to produce:
-`
+```
 ANGELO:
 And cowards it be strawn to my bed,
 And thrust the gates of my threats,
@@ -19,11 +19,11 @@ If you have done evils of all disposition
 To end his power, the day of thrust for a common men
 That I leave, to fight with over-liking
 Hasting in a roseman.
-`
+```
 
 
 Conversely, picoGPT needs no attention,197376 params, and in fact only O(N) compute roughly to produce:
-`
+```
 ROMEO: Juliet, do you love me?  JULIET:
 The mine thus a king
 To part of you?
@@ -99,4 +99,4 @@ At of men;
 ever not run-deap timerrK:
 Everious eneman, to advised
 If it nothing after inform whic
-`
+```
