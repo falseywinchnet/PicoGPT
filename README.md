@@ -21,8 +21,7 @@ That I leave, to fight with over-liking
 Hasting in a roseman.
 ```
 
-
-Conversely, picoGPT needs no attention, 787,968 params, and in fact only O(N) compute roughly to produce:
+Conversely, picoGPT needs no attention, 197,376 params, and in fact only O(N) compute roughly to produce:
 ```
 ROMEO: Juliet, do you love me?  JULIET:
 The mine thus a king
