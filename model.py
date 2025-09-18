@@ -403,9 +403,6 @@ class GRUStyleRefinementAttention(nn.Module):
       - dipole_weight (float): weight for dipole logit augmentation (default 0.25)
       - use_alignment_noise (bool): enable mild aligner (default True)
       - sigma_min, sigma_max, lam, gamma, eps: aligner params
-
-    18.8.25 whether or not to apply SpiralMix(q,k,v)-> q,k,_ is uncertain
-    
     """
 
     def __init__(self, config):
@@ -562,62 +559,88 @@ class GRUStyleRefinementAttention(nn.Module):
         B, T, C = x.shape
         assert C == self.n_embd
         device = x.device
-
-        # Projections
-        Q = self.Wq(x)
-        K = self.Wk(x)
-        V = self.Wv(x)
-
-        # Multi-head split
+        eps = 1e-30
+    
+        # --- Projections ---
+        Q = self.Wq(x)                           # (B,T,C)
+        K = self.Wk(x)                           # (B,T,C)
+        V = self.Wv(x)                           # (B,T,C)
+    
+        # --- Multi-head split ---
         Qh = self._shape_heads(Q, self.n_heads)  # (B,H,T,D)
-        Kh = self._shape_heads(K, self.n_heads)
-        Vh = self._shape_heads(V, self.n_heads)
-        Vh_exp = torch.exp(Vh)  # LASER
-
-        # Global sigmoid-attn bias for stability per sequence length
-        b_scalar = -math.log(max(T, 1))
-
-        # ---------------- 1) Seed: low-rank EA+Sigmoid+LASER -> H0 ----------------
-        Qr = self.Pq(Q)              # (B,T,r)
-        Kr = self.Pk(K)              # (B,T,r)
-        Vr = self.Pv(V)              # (B,T,r)
-        Vr_exp = torch.exp(Vr)
-        S_seed = (Qr @ Kr.transpose(1, 2))
-        S_seed.mul_(1.0 / math.sqrt(self.rank)).pow_(2)  # scale then square in-place
-        causal = self._causal_mask(T, device) if attn_mask is None else attn_mask.to(torch.bool)
-        S_seed.masked_fill_(~causal[None, :, :], self.neg_inf)
-        S_seed.add_(b_scalar).sigmoid_()
-        H0_r = S_seed @ Vr_exp
-        H0 = self.up_seed(H0_r)  # (B,T,C)
-
-        # ---------------- 2) Full attention: Near + Far (hierarchical causal) ----------------
-        # Near-field (level 0): banded causal mask width k0
+        Kh = self._shape_heads(K, self.n_heads)  # (B,H,T,D)
+        Vh = self._shape_heads(V, self.n_heads)  # (B,H,T,D)
+    
+        # --- Masks & global bias ---
+        causal = self._causal_mask(T, device) if attn_mask is None else attn_mask.to(torch.bool)  # (T,T)
         k0 = min(self.k0, T - 1)
-        near_mask = self._band_mask(T, device, k0) & causal
-        logits_near = (Qh @ Kh.transpose(-2, -1)) / math.sqrt(self.head_dim)
-        logits_near = logits_near * logits_near
+        near_mask = self._band_mask(T, device, k0) & causal                                       # (T,T)
+        b_scalar = -math.log(max(T, 1))
+    
+        # ---------------- 1) Seed: low-rank EA + Sigmoid + LASER (stable) -> H0 ----------------
+        # Low-rank projections
+        Qr = self.Pq(Q)                     # (B,T,r)
+        Kr = self.Pk(K)                     # (B,T,r)
+        Vr = self.Pv(V)                     # (B,T,r)
+    
+        # EA logits (square) with scaling
+        S_seed = (Qr @ Kr.transpose(1, 2))                   # (B,T,T)
+        S_seed.mul_(1.0 / math.sqrt(self.rank)).pow_(2)      # ((·)/√r)^2
+        S_seed = S_seed.masked_fill(~causal[None, :, :], self.neg_inf)
+        A_seed = torch.sigmoid(S_seed + b_scalar)            # (B,T,T)
+    
+        # LASER on seed values: per-query masked max over keys (causal), then log-sum-exp
+        # Build (B,T,T,r) by expanding keys along a query axis
+        Vr_keys = Vr[:, None, :, :].expand(-1, T, -1, -1)    # (B,T,T,r)
+        neg_inf_seed = torch.finfo(Vr.dtype).min
+        mask_seed = causal[None, :, :, None]                 # (1,T,T,1)
+        Vr_masked = Vr_keys.masked_fill(~mask_seed, neg_inf_seed)
+        m_seed = Vr_masked.amax(dim=2, keepdim=True)         # (B,T,1,r)
+        Yr = (A_seed[..., None] * torch.exp(Vr_keys - m_seed)).sum(dim=2)  # (B,T,r)
+        H0_r = torch.log(Yr.clamp_min(eps)) + m_seed.squeeze(2)            # (B,T,r)
+        H0 = self.up_seed(H0_r)                                            # (B,T,C)
+    
+        # ---------------- 2) Full attention (NEAR path before FAR loop) ----------------
+        # Cosine EA logits for near band
+        tau = getattr(self, "tau", 0.35)
+        Qn = F.normalize(Qh, dim=-1)
+        Kn = F.normalize(Kh, dim=-1)
+        cos = torch.matmul(Qn, Kn.transpose(-2, -1))            # (B,H,T,T) in [-1,1]
+        logits_near = (cos * cos) / tau
         logits_near = logits_near.masked_fill(~near_mask[None, None, :, :], self.neg_inf)
-        A_near = torch.sigmoid(logits_near + b_scalar)
-        H_near_h = A_near @ Vh_exp  # (B,H,T,D)
-
-        # Far-field hierarchical levels
-        H_far_total_h = torch.zeros_like(H_near_h)
+        A_near = torch.sigmoid(logits_near + b_scalar)          # (B,H,T,T)
+    
+        # LASER (stable) for near: causal sliding max over last k0+1 keys (fast, no 5D)
+        # compute per (B,H,T,D) max over keys in window [i-k0, i]
+        kernel = k0 + 1
+        neg_inf_near = torch.finfo(Vh.dtype).min
+        V_perm = Vh.permute(0, 1, 3, 2)                         # (B,H,D,T)
+        V_pad  = F.pad(V_perm, (kernel - 1, 0), value=neg_inf_near)  # left pad with -inf
+        V_unf  = V_pad.unfold(-1, kernel, 1)                    # (B,H,D,T,kernel)
+        m_near = V_unf.max(dim=-1).values.permute(0, 1, 3, 2)   # (B,H,T,D)
+    
+        V_shift = Vh - m_near                                   # (B,H,T,D)
+        V_exp   = torch.exp(V_shift)                            # (B,H,T,D)
+        Y_near  = torch.matmul(A_near, V_exp)                   # (B,H,T,D)
+        H_near_h = torch.log(Y_near.clamp_min(eps)) + m_near    # (B,H,T,D)
+    
+        # Prepare FAR accumulator and blocks
+        H_far_total_h = torch.zeros_like(H_near_h)              # (B,H,T,D)
         blocks_per_level = self._segment_tree_blocks(T, self.levels)
-
+    
+        # ----- FAR LOOP STARTS HERE -----
         for ell, level_blocks in enumerate(blocks_per_level, start=1):
             # per-level bias uses block-level size for stability
             for b in range(B):
                 for h in range(self.n_heads):
-                    Q_all = Qh[b, h]  # (T,D)
-                    K_all = Kh[b, h]
-                    Vexp_all = Vh_exp[b, h]
-
+                    Q_all = Qh[b, h]                            # (T,D)
+                    K_all = Kh[b, h]                            # (T,D)
+                    # raw values; we will shift/exp per-block where needed
                     for (s, e) in level_blocks:
-                        # query block indices [s,e), keys allowed are strictly in the past excluding near band
                         if s >= e:
                             continue
-                        # Keys: union of earlier positions not covered by near band
-                        # We'll take all j < s minus the recent k0 window (far-only region)
+    
+                        # Keys: all j < s minus the recent k0 window (far-only region)
                         j_end = s
                         j_start = 0
                         if j_end <= 0:
@@ -629,67 +652,75 @@ class GRUStyleRefinementAttention(nn.Module):
                             key_idx_far = key_idx_full
                         if key_idx_far.numel() == 0:
                             continue
-
-                        q_blk = Q_all[s:e]  # (tq,D)
-                        k_blk = K_all[key_idx_far]  # (tk,D)
-                        v_blk = Vexp_all[key_idx_far]  # (tk,D)
-
-                        # --- Mild aligner: standardize + alignment-conditioned noise (optional) ---
+    
+                        # Blocks
+                        q_blk = Q_all[s:e]                      # (tq, D)
+                        k_blk = K_all[key_idx_far]              # (tk, D)
+                        V_keys = Vh[b, h][key_idx_far]          # (tk, D) raw V
+    
+                        # --- mild aligner (optional) ---
                         if self.use_alignment_noise:
                             head_seed = (b + 1) * 1_000_003 + (h + 1) * 911 + (ell + 1) * 97 + (s + 1)
                             q_std, k_std = self._align_noise(q_blk, k_blk, head_seed=head_seed)
                         else:
                             q_std, _, _ = self._standardize(q_blk)
                             k_std, _, _ = self._standardize(k_blk)
-
-                        # --- Independent clustering (MuSe-style) on standardized spaces ---
-                        # Queries clustered within block, keys clustered over far region
+    
+                        # --- independent clustering (MuSe-style) ---
                         Cq = min(self.C, max(1, q_std.size(0)))
                         Ck = min(self.C, max(1, k_std.size(0)))
                         with torch.no_grad():
                             cq, q_assign = self._kmeans_simple(q_std, Cq, iters=2)
                             ck, k_assign = self._kmeans_simple(k_std, Ck, iters=2)
-                        # Centroid values: average V within each K-cluster (LASER already applied)
-                        # Vectorized centroids and dipoles (no Python loops)
-                        one_hot = torch.nn.functional.one_hot(k_assign, num_classes=Ck).to(v_blk.dtype)  # (tk, Ck)
-                        count = one_hot.sum(dim=0).clamp_min(1.0)                                       # (Ck,)
-                        v_cent = (one_hot.T @ v_blk) / count[:, None]                                    # (Ck, Dv)
-                        
-                        ck_assigned = ck[k_assign]                                                       # (tk, Dk)
-                        resid = k_std - ck_assigned                                                      # (tk, Dk)
-                        dipole = (one_hot.T @ resid) / count[:, None]            
-
-                        # Coarse EA logits on centroids (queries vs key-centroids)
-                        S = (q_std @ ck.t()) / math.sqrt(self.head_dim)
-                        S = S * S  # EA square
-                        # Dipole linear augmentation (small)
+    
+                        one_hot = F.one_hot(k_assign, num_classes=Ck).to(V_keys.dtype)  # (tk, Ck)
+                        count = one_hot.sum(dim=0).clamp_min(1.0)                        # (Ck,)
+    
+                        # dipole (optional)
+                        ck_assigned = ck[k_assign]                 # (tk, D)
+                        resid = k_std - ck_assigned                # (tk, D)
+                        dipole = (one_hot.T @ resid) / count[:, None]
+    
+                        # cosine EA logits over centroids
+                        qcn = F.normalize(q_std, dim=-1)
+                        ckn = F.normalize(ck, dim=-1)
+                        S = (qcn @ ckn.t())                        # (tq, Ck) in [-1,1]
+                        S = (S * S) / tau
                         if self.dipole_weight != 0.0:
                             S = S + self.dipole_weight * ((q_std @ dipole.t()) / math.sqrt(self.head_dim))
-
-                        # Sigmoid attention with per-level bias
+    
+                        # sigmoid attention with per-level bias
                         b_level = -math.log(max(ck.size(0), 1))
-                        A = torch.sigmoid(S + b_level)
-
-                        # Aggregate to values
-                        H_blk = A @ v_cent  # (tq,D)
-                        # Scatter-add into H_far_total_h[b,h,s:e,:]
+                        A = torch.sigmoid(S + b_level)             # (tq, Ck)
+    
+                        # LASER (stable) in far block: shift -> exp -> cluster -> sum -> log + m
+                        m_blk = V_keys.max(dim=0, keepdim=True).values          # (1, D)
+                        V_exp_blk = torch.exp(V_keys - m_blk)                   # (tk, D)
+                        v_cent_exp = (one_hot.T @ V_exp_blk) / count[:, None]   # (Ck, D)
+                        Y_blk = A @ v_cent_exp                                  # (tq, D)
+                        H_blk = torch.log(Y_blk.clamp_min(eps)) + m_blk         # (tq, D)
+    
                         H_far_total_h[b, h, s:e] += H_blk
-
-               # Sum near and far
-        H_refine_h = H_near_h + H_far_total_h
-        
+    
+        # ----- FAR LOOP ENDS HERE -----
+    
+        # Sum near and far
+        H_refine_h = H_near_h + H_far_total_h                                  # (B,H,T,D)
+    
         # ---------------- 3) Head-wise gated attention on refined path ----------------
         gate_scores = torch.einsum('bhtd,hd->bht', Qh, self.gate_u) + self.gate_b[None, :, None]
         H_refine_h = H_refine_h * torch.sigmoid(gate_scores)[..., None]
-        Ht = self._merge_heads(H_refine_h)  # single merge
-
+        Ht = self._merge_heads(H_refine_h)                                      # (B,T,C)
+    
         # ---------------- 4) GRU-style blend ----------------
         if self.use_reset_gate:
             r = torch.sigmoid(self.Wr(torch.cat([Q, K, H0], dim=-1)))
             Ht = r * Ht
-        z = torch.sigmoid(self.Wz(torch.cat([Q, K, H0, Ht], dim=-1)))
+    
+        g = self.Wz(torch.cat([Q, K, H0, Ht], dim=-1))
+        z = 0.5 * (torch.tanh(g) + 1.0)     # smoother than sigmoid but still (0,1)
         H_out = (1.0 - z) * H0 + z * Ht
-
+    
         return self.Wo(H_out)
 
 
