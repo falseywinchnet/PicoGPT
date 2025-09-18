@@ -21,4 +21,4 @@ warrantee of suitability, and is excempt from all known controls on
 software distribution. 
 
 
-Binaries for your platform and architecture are available on request. 
+
