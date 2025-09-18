@@ -1,5 +1,12 @@
 #copyright joshuah.rainstar@gmail.com 2025 
 #MIT License terms apply
+#the only challenge remaining in terms of the base transformer architecture(this is an optimal design)
+#is the MLP. MLP = designed to learn functions.
+#the role of an MLP is, however, a learned codebook. 
+#now, we believe one could massively scale up blocks- 
+#and that one could sigmoid route blocks, or use similar expert selection mechanisms.
+#but it can't be MLP. it has to be the entire block.
+
 from __future__ import annotations
 import math
 import typing
