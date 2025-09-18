@@ -6,6 +6,8 @@
 #now, we believe one could massively scale up blocks- 
 #and that one could sigmoid route blocks, or use similar expert selection mechanisms.
 #but it can't be MLP. it has to be the entire block.
+#note: lots of optimization needed to get this attention to behave on cuda and fast.
+#testing only done on an m4 mac
 
 from __future__ import annotations
 import math
