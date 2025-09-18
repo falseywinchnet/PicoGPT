@@ -717,10 +717,15 @@ class GRUStyleRefinementAttention(nn.Module):
             r = torch.sigmoid(self.Wr(torch.cat([Q, K, H0], dim=-1)))
             Ht = r * Ht
     
-        g = self.Wz(torch.cat([Q, K, H0, Ht], dim=-1))
-        z = 0.5 * (torch.tanh(g) + 1.0)     # smoother than sigmoid but still (0,1)
-        H_out = (1.0 - z) * H0 + z * Ht
     
+        g = self.Wz(torch.cat([Q, K, H0, Ht], dim=-1))
+        #z = 0.5 * (torch.tanh(g) + 1.0)     # smoother than sigmoid but still (0,1)
+        #H_out = (1.0 - z) * H0 + z * Ht
+    
+        #return self.Wo(H_out)
+        z = torch.sigmoid(g)
+        H_out = (1.0 - z) * H0 + z * Ht
+
         return self.Wo(H_out)
 
 
