@@ -2,7 +2,7 @@
 
 ## Abstract
 
-We catalog eight structural failure modes of attention-based sequence models that persist even as we scale data, parameters, and engineering tricks. The failures arise from (1) the foundational partition imposed by tokenization, (2) the computational scaling of pairwise mixing, (3) the absence of intrinsic multi-scale structure, (4) geometric rather than semantic partitioning, (5) dynamic context collapse under autoregressive training, (6) in-place evolution of internal representations, (7) preconditioning decay with depth, and (8) the continuous-decoder limitation (MLPs as phase shifters/codebooks that cannot implement discrete selection). We review near/far-field attention (e.g., FMM-like decompositions) and multipole clustering (e.g., MuSe), which reduce cost but not structural deficiency. We then propose a causal, dyadic phase-transport feature pyramid that encodes token-to-token and sequence-to-sequence relations at multiple granularities, plus small, explicit “decision slots” for persistent plan/state. This reframes the problem from on-the-fly discovery to signal encoding, shrinking the semantic search budget. The remaining obstacle is selection: replacing uniformized, continuous blending with decisive, persistent routing across multiscale signals.
+We catalog eight structural failure modes of sequential language prediction models that persist even as we scale data, parameters, and engineering tricks. The failures arise from (1) the foundational partition imposed by tokenization, (2) the computational scaling of pairwise mixing, (3) the absence of intrinsic multi-scale structure, (4) geometric rather than semantic partitioning, (5) dynamic context collapse under autoregressive training, (6) in-place evolution of internal representations, (7) preconditioning decay with depth, and (8) the continuous-decoder limitation (MLPs as phase shifters/codebooks that cannot implement discrete selection). We review various prior art, which reduce cost but not structural deficiency. We then propose a causal, dyadic phase-transport feature pyramid that encodes token-to-token and sequence-to-sequence relations at multiple granularities, plus small, explicit “decision slots” for persistent plan/state. This reframes the problem from on-the-fly discovery to signal encoding, shrinking the semantic search budget. The remaining obstacle is selection: replacing uniformized, continuous blending with decisive, persistent routing across multiscale signals.
 
 ---
 
@@ -135,12 +135,127 @@ Transformer attention mixes all past positions based on content. Its striking ca
 
 ---
 
-## 4. Prior efficiency remedies (what they fix, what they don’t)
+## 4: Prior Efficacy Remedies (for integration)
 
-* **Near/Far-field decompositions (FMM-like).** Split attention into banded local and low-rank global terms. This reduces compute, not the structural absence of semantic hierarchy. Partitions remain geometric and fixed relative to the grid.
-* **Multipole semantic clustering (e.g., MuSe).** Cluster queries and keys separately; approximate cluster interactions with monopole/dipole summaries. Improves runtime at long context with small quality loss, but selection across clusters remains continuous, and partition choice remains external to semantics.
+This section reframes “prior efficiency remedies” as **prior efficacy remedies**: a survey of methods that improved *how well* models process long sequences or reduce compute/latency, while highlighting **which structural problems they do—and do not—address**. The theme: most advances optimize *how information is moved*, not *how information is chosen*. They close performance gaps by lowering the semantic search budget or stabilizing training, but leave selection and semantic partitioning largely unresolved.
 
-**Bottom line:** These address Failure 2 (cost) and nibble at Failure 3 (some hierarchical flavor) but leave Failures 4–8 largely intact.
+---
+
+### 1) Attention Engineering
+
+#### Memory-/compute-optimized kernels
+
+* **FlashAttention / xFormers kernels**: IO-aware tiling, fused softmax, better memory locality.
+* **MQA/GQA**: Multi-Query / Grouped-Query Attention reduce KV bandwidth and cache size.
+* **KV-cache compression/quantization**: Smaller state at inference.
+  **Efficacy:** Dramatic speed/latency gains, enabling longer contexts in practice.
+  **Limits:** Only targets **F2 (cost)**. No change to semantic structure, selection, or hierarchy (**F3–F8 persist**).
+
+#### Sparse patterns (geometric pruning)
+
+* **Longformer / BigBird / Block-Sparse**: Sliding windows + a few global tokens; dilations/strides.
+* **Routing by position patterns**: Local+global tokens with fixed templates.
+  **Efficacy:** Linear or near-linear complexity, good on tasks where locality dominates.
+  **Limits:** Partitions are **geometric**, not semantic (**F4**). Selection stays continuous (**F5/F8**). Multi-scale is still implicit (**F3**).
+
+#### Low-rank / landmark approximations
+
+* **Linformer** (projection in sequence), **Nyströmformer** (landmark points), **AFT** (attention-free transformers with fixed kernels).
+  **Efficacy:** Reduce quadratic mixing by low-rank structure; scale to longer contexts.
+  **Limits:** Impose fixed geometric/low-rank views (**F4**); no learned semantic partition controller (**F3**); equal-importance pressure remains (**F5**).
+
+#### Kernel/linear attention
+
+* **Performer / FAVOR+**, **Linear Transformers**, **Implicit kernelized variants**.
+  **Efficacy:** Sub-quadratic; sometimes better stability for long contexts.
+  **Limits:** Still continuous blending (**F8**), soft selection pressure (**F5**), no explicit hierarchy (**F3**).
+
+#### Clustering/routing & multipole approximations
+
+* **Reformer** (LSH buckets), **Routing Transformer** (k-means clustering), **inference-time k-means** on keys, **MuSe** (monopole+dipole cluster summaries), **FMM-like** near/far-field splits.
+  **Efficacy:** Big runtime savings; better long-range coverage than fixed windows; sometimes competitive pretraining loss.
+  **Limits:** Clusters are primarily **geometric**; selection across clusters is still weighted averaging (**F4/F5/F8**). No end-to-end semantic controller (**F3**).
+
+#### Positional schemes for long context
+
+* **RoPE, ALiBi, PI/NTK scaling, relative positions**.
+  **Efficacy:** Better length extrapolation and stability; enables longer windows without retraining from scratch.
+  **Limits:** Improves geometry of the manifold, not selection or hierarchy (**F3–F5, F8** unchanged).
+
+---
+
+### 2) State-Space & Convolutional Families
+
+#### Structured State Space Models (SSMs)
+
+* **S4/S5/S6**, **Selective SSMs**, **Mamba**: learn long-range dependencies with linear-time recurrences and stable spectral parameterizations.
+  **Efficacy:** Excellent scaling and gradient stability; strong long-context performance; controllable inductive bias (decay kernels, frequency responses).
+  **Limits:** Processing remains **continuous**; partitions are still **temporal/geometric**; no intrinsic discrete selection (**F4/F8**). In-place evolution and decay of preconditioning persist (**F6/F7**).
+
+#### Convolutional/long-filter models
+
+* **Hyena/HyenaDNA**, long convolutions with learned filters; frequency-domain parameterizations; hierarchical compositions.
+  **Efficacy:** Linear-time, large receptive fields, competitive or superior to attention on long-seq benchmarks; favorable hardware utilization.
+  **Limits:** Filters are global but fixed-form; no semantic partition controller; selection is continuous averaging; hierarchy implicit (**F3/F5/F8**).
+
+#### Retention / hybrid recurrent families
+
+* **RetNet** (retention mechanism), **RWKV** (RNN/Transformer hybrid): approximate attention with recurrent operators and better memory footprints.
+  **Efficacy:** Streaming-friendly; long horizons with stable compute; sometimes matches attention on perplexity.
+  **Limits:** Still continuous routing; lacks discrete, persistent semantic selection; geometric rather than semantic grouping.
+
+---
+
+### 3) Capacity & Routing at the Model Scale
+
+#### Mixture-of-Experts (MoE)
+
+* **Switch/GShard/GLaM-style** sparse expert routing.
+  **Efficacy:** Scales parameter count without proportional compute; conditional computation boosts capacity.
+  **Limits:** Routing is learned but remains a **soft/continuous gate** in practice; does not instantiate semantic hierarchy within sequences; selection often noisy without strong priors.
+
+#### External or learned memory
+
+* **RAG/kNN-LM**, **Memory Transformers**, **DNC/NTM-style** controllers.
+  **Efficacy:** Offloads recall; improves factual grounding and long-horizon tasks.
+  **Limits:** Memory addresses are learned but remain differentiable/continuous; selection often reduces to soft attention over memory—reintroducing **F5/F8**.
+
+---
+
+### 4) Why these remedies “catch up” in performance
+
+* **They shrink the semantic search space.** By constraining geometry (windows, kernels, filters) or by linearizing cost, models spend less capacity on *finding* relations and more on *using* them.
+* **They improve signal-to-noise at long range.** SSMs/Hyena stabilize gradients and preserve useful low-frequency structure, reducing over-smoothing.
+* **They align with hardware.** Fused kernels, linear-time recurrences, and FFT-based filters make better use of memory bandwidth and parallelism, translating directly into throughput and trainable context length.
+* **They add mild inductive bias.** Positional scalings, decaying kernels, and hierarchical filters bias models toward plausible long-range patterns, closing gaps on long-seq benchmarks.
+
+**But:** They optimize **manipulation** of information, not **selection** of information. As a result, they narrow the performance gap without resolving the structural issues that cause uniform blending, emergent brittleness, and shallow semantic commitment.
+
+---
+
+### 5) Mapping remedies to structural failures
+
+| Remedy family                          | F1 Tokenization | F2 Cost             | F3 Multi-scale          | F4 Geometric vs. Semantic | F5 Equal-importance                   | F6 In-place evolution | F7 Preconditioning decay | F8 Continuous decoder |
+| -------------------------------------- | --------------- | ------------------- | ----------------------- | ------------------------- | ------------------------------------- | --------------------- | ------------------------ | --------------------- |
+| Flash/xFormers/MQA/GQA                 | –               | **✓✓**              | –                       | –                         | –                                     | –                     | –                        | –                     |
+| Sparse attention (Longformer/BigBird)  | –               | **✓**               | (±) implicit            | **✗** geometric           | –                                     | –                     | –                        | –                     |
+| Low-rank/landmarks (Linformer/Nyström) | –               | **✓**               | –                       | **✗** geometric           | –                                     | –                     | –                        | –                     |
+| Kernel/linear (Performer, Linear Attn) | –               | **✓**               | –                       | **✗** geometric           | –                                     | –                     | –                        | **✗** continuous      |
+| Clustering/FMM/MuSe                    | –               | **✓**               | (±) hierarchical flavor | **✗** geometric clusters  | –                                     | –                     | –                        | **✗** continuous      |
+| Positional schemes (RoPE/ALiBi)        | –               | –                   | (±) better scaling      | –                         | –                                     | –                     | –                        | –                     |
+| SSMs (S4/Mamba)                        | –               | **✓✓**              | (±) via filters         | **✗** temporal geometry   | –                                     | –                     | –                        | **✗** continuous      |
+| Long convs (Hyena)                     | –               | **✓✓**              | (±) via hier. filters   | **✗** temporal geometry   | –                                     | –                     | –                        | **✗** continuous      |
+| Retention/RNN hybrids (RetNet/RWKV)    | –               | **✓**               | (±)                     | **✗** temporal geometry   | –                                     | –                     | –                        | **✗** continuous      |
+| MoE (Switch/GLaM)                      | –               | (compute per token) | –                       | –                         | –                                     | –                     | –                        | **✗** soft gates      |
+| External memory / RAG                  | –               | (offloads)          | –                       | –                         | – (often reintroduces soft attention) | –                     | –                        | **✗** continuous      |
+
+Legend: **✓✓** strong improvement, **✓** moderate, (±) partial/indirect, **✗** unaddressed; “–” = no material effect.
+
+---
+
+### 6) Takeaway for integration
+
+These remedies **explain how non-attention models and engineered attention variants have caught up**: they constrain geometry, linearize cost, stabilize gradients, and bias toward useful long-range patterns. Yet, across families, the core limitations remain: partitions are still **geometric**, selection is **continuous blending**, structure **drifts in place**, and preconditioning **fades with depth**. They elevate efficacy, not structural semantics. 
 
 ---
 
