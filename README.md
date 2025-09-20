@@ -137,11 +137,11 @@ Transformer attention mixes all past positions based on content. Its striking ca
 
 ## 4: Prior Efficacy Remedies (for integration)
 
-This section reframes “prior efficiency remedies” as **prior efficacy remedies**: a survey of methods that improved *how well* models process long sequences or reduce compute/latency, while highlighting **which structural problems they do—and do not—address**. The theme: most advances optimize *how information is moved*, not *how information is chosen*. They close performance gaps by lowering the semantic search budget or stabilizing training, but leave selection and semantic partitioning largely unresolved.
+This section reframes “prior efficiency remedies” as **prior efficacy remedies**: a survey of methods that improved *how well* models process long sequences or reduce compute/latency, while highlighting **which structural problems they do—and do not—address**. The theme: most advances optimize *how information is moved*, not *how information is chosen*. They close performance gaps by lowering the semantic search budget or stabilizing training, but leave selection and semantic partitioning largely unresolved. they constrain geometry, linearize cost, stabilize gradients, and bias toward useful long-range patterns. Yet, across families, the core limitations remain: partitions are still **geometric**, selection is **continuous blending**, structure **drifts in place**, and preconditioning **fades with depth**. They elevate efficacy, not structural semantics. 
 
 ---
 
-### 1) Attention Engineering
+### a) Attention Engineering
 
 #### Memory-/compute-optimized kernels
 
@@ -184,7 +184,7 @@ This section reframes “prior efficiency remedies” as **prior efficacy remedi
 
 ---
 
-### 2) State-Space & Convolutional Families
+### b) State-Space & Convolutional Families
 
 #### Structured State Space Models (SSMs)
 
@@ -206,7 +206,7 @@ This section reframes “prior efficiency remedies” as **prior efficacy remedi
 
 ---
 
-### 3) Capacity & Routing at the Model Scale
+### c) Capacity & Routing at the Model Scale
 
 #### Mixture-of-Experts (MoE)
 
@@ -222,7 +222,7 @@ This section reframes “prior efficiency remedies” as **prior efficacy remedi
 
 ---
 
-### 4) Why these remedies “catch up” in performance
+### d) Why these remedies “catch up” in performance
 
 * **They shrink the semantic search space.** By constraining geometry (windows, kernels, filters) or by linearizing cost, models spend less capacity on *finding* relations and more on *using* them.
 * **They improve signal-to-noise at long range.** SSMs/Hyena stabilize gradients and preserve useful low-frequency structure, reducing over-smoothing.
@@ -233,7 +233,7 @@ This section reframes “prior efficiency remedies” as **prior efficacy remedi
 
 ---
 
-### 5) Mapping remedies to structural failures
+### e) Mapping remedies to structural failures
 
 | Remedy family                          | F1 Tokenization | F2 Cost             | F3 Multi-scale          | F4 Geometric vs. Semantic | F5 Equal-importance                   | F6 In-place evolution | F7 Preconditioning decay | F8 Continuous decoder |
 | -------------------------------------- | --------------- | ------------------- | ----------------------- | ------------------------- | ------------------------------------- | --------------------- | ------------------------ | --------------------- |
@@ -251,11 +251,6 @@ This section reframes “prior efficiency remedies” as **prior efficacy remedi
 
 Legend: **✓✓** strong improvement, **✓** moderate, (±) partial/indirect, **✗** unaddressed; “–” = no material effect.
 
----
-
-### 6) Takeaway for integration
-
-These remedies **explain how non-attention models and engineered attention variants have caught up**: they constrain geometry, linearize cost, stabilize gradients, and bias toward useful long-range patterns. Yet, across families, the core limitations remain: partitions are still **geometric**, selection is **continuous blending**, structure **drifts in place**, and preconditioning **fades with depth**. They elevate efficacy, not structural semantics. 
 
 ---
 
