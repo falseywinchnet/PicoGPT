@@ -1,14 +1,4 @@
-#copyright joshuah.rainstar@gmail.com 2025 
-#MIT License terms apply
-#the only challenge remaining in terms of the base transformer architecture(this is an optimal design)
-#is the MLP. MLP = designed to learn functions.
-#the role of an MLP is, however, a learned codebook. 
-#now, we believe one could massively scale up blocks- 
-#and that one could sigmoid route blocks, or use similar expert selection mechanisms.
-#but it can't be MLP. it has to be the entire block.
-#note: lots of optimization needed to get this attention to behave on cuda and fast.
-#testing only done on an m4 mac
-
+#copyright joshuah.rainstar@gmail.com 2025
 from __future__ import annotations
 import math
 import typing
@@ -17,700 +7,391 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from dataclasses import dataclass
-from typing import Optional, Dict, Tuple, List
-
-class PairwiseRotSpiral(nn.Module):
-    def __init__(self, dim, radius=6.0, omega=1.0, k=1.0, step=0.1, cube_shell=False):
-        super().__init__()
-        self.dim = dim
-        self.radius = float(radius)
-        self.omega = float(omega)
-        self.k = float(k)
-        self.step = float(step)
-        self.cube_shell = bool(cube_shell)
-        self.eps = 1e-8
-
-    def _cos_sin(self, x):
-        theta = self.omega * self.step
-        # Use Python math for scalar, then create tensors on correct device and dtype
-        c = torch.tensor(math.cos(theta), device=x.device, dtype=x.dtype)
-        s = torch.tensor(math.sin(theta), device=x.device, dtype=x.dtype)
-        return c, s
-
-    def forward(self, x):
-        D = x.size(-1)
-        # radial term
-        r = torch.linalg.vector_norm(x, dim=-1, keepdim=True).clamp_min(self.eps)
-        radial = (self.radius - r) * (x / r)
-
-        # rotation on 2D pairs, vectorized
-        if D >= 2:
-            c, s = self._cos_sin(x)
-            n2 = D // 2
-            head = x[..., : n2 * 2].reshape(*x.shape[:-1], n2, 2)
-            xi = head[..., 0]
-            xj = head[..., 1]
-            yi = c * xi - s * xj
-            yj = s * xi + c * xj
-            rot = torch.stack([yi, yj], dim=-1).reshape(*x.shape[:-1], n2 * 2)
-            if D % 2 == 1:
-                y = torch.cat([rot, x[..., -1:].contiguous()], dim=-1)
-            else:
-                y = rot
-        else:
-            y = x
-
-        # one-step Euler update
-        y = x + self.step * ((y - x) + self.k * radial)
-
-        if self.cube_shell:
-            y = self.radius * torch.tanh(y / self.radius)
-        return y
+from typing import Dict, Tuple
 
 
+def phase_transport_between(curr: torch.Tensor, prev: torch.Tensor, tau: float = 1e-6) -> torch.Tensor:
+    B, T, C = curr.shape
+    eps = tau
 
-class SpiralMix(nn.Module):
-    def __init__(self, rank, **spiral_kwargs):
-        super().__init__()
-        self.rank = rank
-        self.flow = PairwiseRotSpiral(rank, **spiral_kwargs)
+    u = _unit(curr)
+    v = _unit(prev)
+    w = curr - prev
 
-    def forward(self, comps, center=None, loop_iters=2):
-        # Accept either a list/tuple of [...,] Tensors or a single Tensor [..., r]
-        if isinstance(comps, (list, tuple)):
-            # old DynMix API: list of [B,T] or [B] -> stack on last dim -> [B,T,r] (or [B,r])
-            x = torch.stack(comps, dim=-1)
-            return_list = True
-        else:
-            # new API: comps is already [B,T,r] (or any leading dims, last is r)
-            x = comps
-            return_list = False
+    c = (u * v).sum(dim=-1, keepdim=True)  # (B,T,1)
 
-        if center is None:
-            center = 0.0  # broadcastable scalar OK
-        y = x
-        for _ in range(loop_iters):
-            y = self.flow(y - center) + center  # pairwise rotations on last dim only
+    # masks (all as (B,T))
+    near_pos = (c > 1.0 - tau).squeeze(-1)           # (B,T)
+    near_neg = (c < -1.0 + tau).squeeze(-1)          # (B,T)
+    small_u  = (_norm(curr) < tau).squeeze(-1)       # (B,T)  <-- FIX
+    small_v  = (_norm(prev) < tau).squeeze(-1)       # (B,T)  <-- FIX
+    trivial  = near_pos | small_u | small_v          # (B,T)
 
-        if return_list:
-            # match DynMix return type: list of [...,] tensors
-            return [y[..., i] for i in range(y.size(-1))]
-        return y
+    # general branch
+    denom  = (1.0 + c).clamp_min(eps)                # (B,T,1)
+    a = (v * w).sum(dim=-1, keepdim=True)
+    b = (u * w).sum(dim=-1, keepdim=True)
+    Kw  = u * a - v * b
+    K2w = u * (a * c - b) + v * (b * c - a)
+    y_gen = w - Kw + (K2w / denom)                   # (B,T,C)
 
+    # antipodal branch
+    if C == 1:
+        y_neg = -w
+    else:
+        v_flat = v.reshape(-1, C)
+        p_flat = _orthonormal_perp(v_flat)
+        p = p_flat.view(B, T, C)
+        proj_v = (v * w).sum(dim=-1, keepdim=True) * v
+        proj_p = (p * w).sum(dim=-1, keepdim=True) * p
+        y_neg = w - 2.0 * proj_v - 2.0 * proj_p
 
-class Coop5(nn.Module):
-    def __init__(self):
-        super().__init__()
+    # blend (no in-place masked writes)
+    y = torch.where(trivial.unsqueeze(-1), w, y_gen)
+    y = torch.where(near_neg.unsqueeze(-1), y_neg, y)
+    return y
 
-    @staticmethod
-    def _softsign(x: torch.Tensor) -> torch.Tensor:
-        return x / (1.0 + x.abs())
+def _norm(v, eps: float = 1e-12):
+    return torch.linalg.vector_norm(v, dim=-1, keepdim=True).clamp_min(eps)
 
-    @staticmethod
-    def _zls(x: torch.Tensor) -> torch.Tensor:
-        sp = F.softplus(x)
-        sa = torch.sigmoid(0.5 * x)
-        ba = sa * (1.0 - sa)
-        return sp - 2.77258872223978123766 * ba  # 4*ln(2)
+def _unit(v, eps: float = 1e-12):
+    return v / _norm(v, eps)
 
-    @staticmethod
-    def forward(R: torch.Tensor, C: torch.Tensor) -> torch.Tensor:
-        # Similarity gating
-        w = Coop5._zls(Coop5._softsign(R * C).sum(dim=-1, keepdim=True) / (2 * R.size(-1) ** 0.5))
-        # RK2-style update
-        k1 = w * (C - R)
-        k2 = w * (C - (R + 0.5 * k1))
-        return R + 0.25 * (k1 - k2)
-
-    '''#may offer better effect, but more costly
-    @staticmethod
-    def forward(R: torch.Tensor, C: torch.Tensor) -> torch.Tensor:
-        # Similarity gating
-        w = Coop5._zls(Coop5._softsign(R * C).sum(dim=-1, keepdim=True) / (2 * R.size(-1) ** 0.5))
-        # RK2-style update
-        k1 = w * (C - R)
-        # Midpoint
-        R_mid = R + 0.5 * k1
-        w2 = Coop5._zls(Coop5._softsign(R_mid * C).sum(dim=-1, keepdim=True) / (2 * R.size(-1) ** 0.5))
-        k2 = w2 * (C - R_mid)
-        return R + 0.25 * (k1 + k2)
-    '''
+def _orthonormal_perp(v: torch.Tensor):
+    # v: (..., C), returns p ⟂ v, ||p||=1
+    *batch, C = v.shape
+    flat = v.reshape(-1, C)
+    idx = torch.argmin(torch.abs(flat), dim=-1)
+    e = torch.zeros_like(flat)
+    e.scatter_(1, idx.unsqueeze(1), 1.0)
+    proj = (e * flat).sum(dim=-1, keepdim=True) * flat
+    p = e - proj
+    p = p / _norm(p)
+    return p.view(*batch, C)
 
 
-class DynMix(nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.coop = Coop5()
-
-    def mix_list(self,xs):
-        n = len(xs)
-        stacked = torch.stack(xs, 0)
-        total = stacked.sum(0)
-        out = []
-        for i in range(n):
-            others_mean = (total - stacked[i]) / (n - 1)
-            out.append(self.coop(stacked[i], others_mean))
-        return out
-
-    def forward(self, comps, loop_iters: int = 2):
-        for _ in range(loop_iters):
-            comps = self.mix_list(comps)
-        return comps
-        
-
-class PhaseTap(nn.Module):
+# ---------- materialize left-aligned centroids at every t for each scale from two trees ----------
+def materialize_centroids_from_trees(x: torch.Tensor, levels0, levels1, K: int):
     """
-    Phase-preserving vector shift with guarded Householder.
-    x: (B,T,C) -> y: (B,T,C)
-      - t < d:  y[:, t, :] = (1/(d - t)) * a
-      - t >= d: y[:, t, :] = H(x_t)^T @ (x_t - x_{t-d})
-    Guards:
-      - near u_t ≈ a: skip reflection, use identity on v
-      - near u_t ≈ -a: use fixed orthonormal b
-      - near zero ||x_t||: skip reflection
+    For each scale W=2^f (f>=1), build mu^{(W)}(t) as the centroid of the left-aligned
+    block that contains t. Uses offset-0 tree if block starts at 0 mod W; otherwise offset-1 tree.
+    Returns: mu_all: (B, T, K-1, C)   (no scale-1 here; K-1 levels for f=1..K-1)
     """
-    def __init__(self, d: int, tau: float = 1e-6):  # ?1 tau
+    B, T, C = x.shape
+    device = x.device
+    t_idx = torch.arange(T, device=device)  # (T,)
+    mus = []
+    for f in range(1, K):
+        W = 1 << f
+        # block start for t: s = floor(t/W)*W
+        s = (t_idx // W) * W           # (T,)
+        use_offset1 = (s % 2 == 1)     # whether the block start is odd (needs tree-1)
+        if f-1 < len(levels0):
+            L0 = levels0[f-1]          # (B, N0, C)
+            N0 = L0.shape[1]
+        else:
+            N0 = 0
+        if f-1 < len(levels1):
+            L1 = levels1[f-1]          # (B, N1, C)
+            N1 = L1.shape[1]
+        else:
+            N1 = 0
+
+        # index within chosen tree:
+        # for offset-0 (blocks [0..W-1], [W..2W-1], ...): idx0 = floor(t/W)
+        # for offset-1 (blocks [1..W], [W+1..2W], ...):   idx1 = floor((t-1)/W)
+        idx0 = (t_idx // W).clamp_max(max(N0-1, 0))
+        idx1 = ((t_idx - 1).clamp_min(0) // W).clamp_max(max(N1-1, 0))
+
+        # gather from the two trees
+        mu0 = L0.index_select(1, idx0) if N0 > 0 else x.new_zeros(B, T, C)
+        mu1 = L1.index_select(1, idx1) if N1 > 0 else x.new_zeros(B, T, C)
+
+        mu = torch.where(use_offset1.view(1, T, 1), mu1, mu0)  # (B,T,C)
+
+        # early region safety: if t < W-1 there is no full left-aligned block yet → zero
+        mu = torch.where((t_idx < (W-1)).view(1, T, 1), torch.zeros_like(mu), mu)
+        mus.append(mu)
+    if len(mus) == 0:
+        return x.new_zeros(B, T, 0, C)
+    return torch.stack(mus, dim=2)  # (B, T, K-1, C)
+
+class CausalCentroidPyramid(nn.Module):
+    """
+    Vectorized causal pyramid:
+      inputs x: (B, T, C)
+      returns deltas: (B, T, K, C)
+        where K = 1 (token PT) + (num_scales-1) (cluster PTs)
+    """
+    def __init__(self, num_scales: int, tau: float = 1e-6):
         super().__init__()
-        assert isinstance(d, int) and d >= 1
-        self.d = d
+        assert num_scales >= 1
+        self.K = num_scales
         self.tau = float(tau)
 
-    @staticmethod
-    def _norm(v: torch.Tensor, eps: float = 1e-12) -> torch.Tensor:
-        return torch.linalg.vector_norm(v, dim=-1).clamp_min(eps)
-
-    @staticmethod
-    def _safe_unit(v: torch.Tensor, eps: float = 1e-12) -> torch.Tensor:
-        n = torch.linalg.vector_norm(v, dim=-1, keepdim=True).clamp_min(eps)
-        return v / n
-
-    def _apply_householder_sym(self, a: torch.Tensor, u: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
-        """
-        Apply H v with H a = u, H = I - 2 w w^T, symmetric so H^T = H.
-        a,u,v: (..., C)
-        Guards near a, near -a, and near zero u.
-        """
-        C = a.shape[-1]
-        # masks
-        dot = (a * u).sum(dim=-1, keepdim=True)                      # (...,1)
-        near_pos = (dot > 1.0 - self.tau).squeeze(-1)                # (...)
-        near_neg = (dot < -1.0 + self.tau).squeeze(-1)               # (...)
-        near_zero_u = (torch.linalg.vector_norm(u, dim=-1) < self.tau)  # (...)
-
-        y = v.clone()
-
-        # general case mask
-        gen = ~(near_pos | near_neg | near_zero_u)
-        if gen.any():
-            w = self._safe_unit(a[gen] - u[gen])
-            wTv = (w * v[gen]).sum(dim=-1, keepdim=True)
-            y[gen] = v[gen] - 2.0 * w * wTv
-
-        # near -a: reflect across fixed b orthonormal to a
-        if near_neg.any():
-            if C == 1:
-                y[near_neg] = -v[near_neg]
-            else:
-                b = torch.zeros_like(a[near_neg])
-                b[..., 1] = 1.0
-                bbT_v = (b * v[near_neg]).sum(dim=-1, keepdim=True)
-                y[near_neg] = v[near_neg] - 2.0 * b * bbT_v
-
-        # near +a or near zero u: identity on v
-        # y[near_pos] and y[near_zero_u] already equal v by init
-
-        return y
-
+    @torch.no_grad()
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        assert x.ndim == 3, "x must be (B,T,C)"
         B, T, C = x.shape
         device = x.device
-        dtype = x.dtype
 
-        y = torch.zeros_like(x)
+        # token-level PT (scale-1)
+        prev_tok = torch.zeros_like(x)
+        if T > 1:
+            prev_tok[:, 1:, :] = x[:, :-1, :].contiguous()
+        d1 = phase_transport_between(x, prev_tok, tau=self.tau)  # (B,T,C)
+        d1[:, :1, :].zero_()  # mask early region (no previous token)
 
-        # anchor a = e0
-        a = torch.zeros(B, 1, C, device=device, dtype=dtype)
-        a[..., 0] = 1.0
+        if self.K == 1:
+            return d1.unsqueeze(2)  # (B,T,1,C)
 
-        # early baseline
-        if self.d > 0:
-            t_idx = torch.arange(T, device=device)
-            early_mask = t_idx < self.d
-            if early_mask.any():
-                denom = (self.d - t_idx[early_mask]).to(dtype=dtype)
-                y[:, early_mask, :] = a.expand(B, early_mask.sum(), C) * denom.unsqueeze(0).reciprocal().unsqueeze(-1)
+        # Build centroids causally with recursive halves
+        mus = []
+        mu_prev = x  # μ_0 = x (width=1)
+        for s in range(1, self.K):              # s=1..K-1 (width W=2^s)
+            W1 = 1 << (s - 1)
+            shifted = torch.zeros_like(mu_prev)
+            if T > W1:
+                shifted[:, W1:, :] = mu_prev[:, :-W1, :].contiguous()  # μ_{s-1}(t - 2^{s-1})
 
-        if T <= self.d:
-            return y
+            mu_s = 0.5 * (mu_prev + shifted)     # μ_s(t)
+            # zero early region t < W-1
+            W = 1 << s
+            if W > 1:
+                mu_s[:, :W-1, :].zero_()
+            mus.append(mu_s)
+            mu_prev = mu_s
 
-        # main region
-        x_t  = x[:, self.d:, :]          # (B,T-d,C)
-        x_tm = x[:, :-self.d, :]         # (B,T-d,C)
-        u_t  = self._safe_unit(x_t)      # (B,T-d,C)
+        mu_all = torch.stack(mus, dim=2) if mus else x.new_zeros(B, T, 0, C)  # (B,T,K-1,C)
 
-        a_bt = a.expand(B, x_t.shape[1], C)
-        v    = x_t - x_tm
+        # PT deltas between adjacent causal chunks
+        d_list = []
+        for j in range(self.K - 1):
+            W = 1 << (j + 1)
+            prev_mu = torch.zeros_like(mu_all[:, :, j, :])
+            if T > W:
+                prev_mu[:, W:, :] = mu_all[:, :-W, j, :].contiguous()
+            d = phase_transport_between(mu_all[:, :, j, :], prev_mu, tau=self.tau)
+            d[:, :W, :].zero_()  # mask early region
+            d_list.append(d)
 
-        if C == 1:
-            y[:, self.d:, :] = v
-            return y
+        d_clusters = torch.stack(d_list, dim=2) if d_list else x.new_zeros(B, T, 0, C)
+        return torch.cat([d1.unsqueeze(2), d_clusters], dim=2)  # (B,T,K,C)
 
-        y[:, self.d:, :] = self._apply_householder_sym(a_bt, u_t, v)
-        return y
-        
-class PhaseTransport(nn.Module):
-    def __init__(self, d: int, tau: float = 1e-6):
+
+# ----- STREAMING STATE FOR INFERENCE -----
+class CausalPyramidState:
+    """
+    O(K) step-time updates, no recompute.
+    For level ℓ we keep a ring buffer of length 2^ℓ storing μ_ℓ (with μ_0=x).
+    That suffices both to:
+      - build μ_{ℓ+1}(t) from μ_ℓ(t) and μ_ℓ(t-2^ℓ)
+      - compute deltas at scale s=ℓ via μ_s(t-2^s)
+    """
+    def __init__(self, num_scales: int, C: int, device, batch_size: int = 1, tau: float = 1e-6):
+        self.K = num_scales
+        self.C = C
+        self.B = batch_size
+        self.device = device
+        self.tau = float(tau)
+        self.t = 0  # number of tokens processed so far
+
+        # ring buffers: list over levels ℓ = 0..K-1, each [B, L=2^ℓ, C]
+        self.buffers = []
+        self.ptrs = []
+        for l in range(self.K):
+            L = 1 << l
+            self.buffers.append(torch.zeros(self.B, L, C, device=device))
+            self.ptrs.append(0)
+
+    def _read_lookback(self, level: int, r: int):
+        """return μ_level(t - r); zeros if not enough history yet"""
+        if self.t < r:
+            return torch.zeros(self.B, self.C, device=self.device)
+        L = self.buffers[level].size(1)
+        idx = (self.ptrs[level] - r) % L
+        return self.buffers[level][:, idx, :]
+
+    def _push(self, level: int, value: torch.Tensor):
+        """write current μ_level(t) and advance ptr"""
+        L = self.buffers[level].size(1)
+        self.buffers[level][:, self.ptrs[level], :] = value
+        self.ptrs[level] = (self.ptrs[level] + 1) % L
+
+    @torch.no_grad()
+    def step(self, x_t: torch.Tensor) -> torch.Tensor:
+        """
+        x_t: (B, C)
+        returns d(t): (B, K, C)  [token PT + (K-1) cluster PTs]
+        """
+        B, C = x_t.shape
+        feats = []
+
+        # ------- token PT (read BEFORE any push) -------
+        prev_x = self._read_lookback(level=0, r=1)  # μ0(t-1)
+        d1 = phase_transport_between(x_t[:, None, :], prev_x[:, None, :], tau=self.tau).squeeze(1)
+        if self.t == 0:
+            d1.zero_()
+        feats.append(d1)
+
+        # ------- (A) compute all μ_s(t) with pre-push lookbacks -------
+        mu_curr = [None] * self.K
+        mu_curr[0] = x_t                      # μ0(t)
+        mu_prev = x_t
+        for s in range(1, self.K):
+            W1 = 1 << (s - 1)
+            W  = 1 << s
+            mu_back = self._read_lookback(level=s-1, r=W1)   # μ_{s-1}(t - 2^{s-1})  (pre-push!)
+            mu_s_t  = 0.5 * (mu_prev + mu_back)              # μ_s(t)
+            if self.t < (W - 1):                             # early mask (global t)
+                mu_s_t.zero_()
+            mu_curr[s] = mu_s_t
+            mu_prev = mu_s_t
+
+        # ------- (B) compute all deltas d_s using μ_s(t−W) (pre-push) -------
+        for s in range(1, self.K):
+            W = 1 << s
+            mu_prevW = self._read_lookback(level=s, r=W)     # μ_s(t - 2^s)  (pre-push!)
+            d_s = phase_transport_between(mu_curr[s][:, None, :], mu_prevW[:, None, :], tau=self.tau).squeeze(1)
+            if self.t + 1 <= W:
+                d_s.zero_()
+            feats.append(d_s)
+
+        # ------- (C) push μ_ℓ(t) for all levels, exactly once -------
+        self._push(level=0, value=mu_curr[0])
+        for s in range(1, self.K):
+            self._push(level=s, value=mu_curr[s])
+
+        self.t += 1
+        return torch.stack(feats, dim=1)  # (B, K, C)
+
+
+class SemanticClusterFeaturesCausal(nn.Module):
+    """
+    Unified wrapper:
+      - forward(x): vectorized for training
+      - step(x_t, state): single-step for inference with cache
+    """
+    def __init__(self, num_scales: int, tau: float = 1e-6):
         super().__init__()
-        assert isinstance(d, int) and d >= 1
-        self.d = d
+        self.pyramid = CausalCentroidPyramid(num_scales=num_scales, tau=tau)
+        self.K = num_scales
         self.tau = float(tau)
 
-    @staticmethod
-    def _norm(v: torch.Tensor, eps: float = 1e-12) -> torch.Tensor:
-        return torch.linalg.vector_norm(v, dim=-1).clamp_min(eps)
-
-    @staticmethod
-    def _safe_unit(v: torch.Tensor, eps: float = 1e-12) -> torch.Tensor:
-        n = torch.linalg.vector_norm(v, dim=-1, keepdim=True).clamp_min(eps)
-        return v / n
-
-    @staticmethod
-    def _orthonormal_perp(v: torch.Tensor) -> torch.Tensor:
-        # v: (N, C) assumed nonzero
-        N, C = v.shape
-        idx = torch.argmin(torch.abs(v), dim=-1)      # pick coord with smallest magnitude
-        e = torch.zeros_like(v)
-        e.scatter_(1, idx.unsqueeze(1), 1.0)
-        p = e - (e * v).sum(dim=-1, keepdim=True) * v # Gram-Schmidt
-        p = p / PhaseTransport._norm(p).unsqueeze(-1)
-        return p
-
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        assert x.ndim == 3, "x must be (B,T,C)"
-        B, T, C = x.shape
-        device, dtype = x.device, x.dtype
-        y = torch.zeros_like(x)
+        return self.pyramid(x)  # (B,T,K,C)
 
-        # early baseline with per-sequence direction, not a global axis
-        if T > 0:
-            ref_t = min(self.d, T - 1)
-            u_ref = self._safe_unit(x[:, ref_t, :])  # (B, C)
-            if self.d > 0:
-                t_idx = torch.arange(T, device=device)
-                early_mask = t_idx < self.d
-                if early_mask.any():
-                    denom = (self.d - t_idx[early_mask]).to(dtype=dtype)     # (Te,)
-                    scales = (1.0 / denom).view(1, -1, 1)                    # (1, Te, 1)
-                    y[:, early_mask, :] = u_ref.view(B, 1, C) * scales       # (B, Te, C)
+    @torch.no_grad()
+    def step(self, x_t: torch.Tensor, state: CausalPyramidState) -> torch.Tensor:
+        return state.step(x_t)  # (B,K,C)
 
-        if T <= self.d:
-            return y
 
-        # main region t >= d
-        xt  = x[:, self.d:, :]             # (B, T-d, C)
-        xtm = x[:, :-self.d, :]            # (B, T-d, C)
-        u   = self._safe_unit(xt)          # (B, T-d, C)
-        v   = self._safe_unit(xtm)         # (B, T-d, C)
-        w   = xt - xtm                      # (B, T-d, C)
 
-        c = (u * v).sum(dim=-1, keepdim=True)          # (B, T-d, 1)
-        # squeeze masks to (B, T-d)
-        near_pos = (c > 1.0 - self.tau).squeeze(-1)
-        near_neg = (c < -1.0 + self.tau).squeeze(-1)
-        small_u  = (torch.linalg.vector_norm(xt,  dim=-1) < self.tau)
-        small_v  = (torch.linalg.vector_norm(xtm, dim=-1) < self.tau)
-        trivial  = near_pos | small_u | small_v
+# ---------------------------
+# Small utilities
+# ---------------------------
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
 
-        y_main = w.clone()
-
-        # general case
-        gen = ~(trivial | near_neg)
-        if gen.any():
-            u_g = u[gen]                       # (N, C)
-            v_g = v[gen]
-            w_g = w[gen]
-            c_g = c[gen].unsqueeze(-1)[:, 0, :]  # (N, 1) ensure 2D
-            alpha = 1.0 / (1.0 + c_g)          # (N, 1)
-
-            a = (v_g * w_g).sum(dim=-1, keepdim=True)  # v·w
-            b = (u_g * w_g).sum(dim=-1, keepdim=True)  # u·w
-            Kw  = u_g * a - v_g * b
-            K2w = u_g * (a * c_g - b) + v_g * (b * c_g - a)
-            y_main[gen] = w_g - Kw + alpha * K2w
-
-        # antipodal 180 deg
-        if near_neg.any():
-            v_n = v[near_neg]                 # (N, C)
-            w_n = w[near_neg]
-            p   = self._orthonormal_perp(v_n) # (N, C)
-            proj_v = (v_n * w_n).sum(dim=-1, keepdim=True) * v_n
-            proj_p = (p   * w_n).sum(dim=-1, keepdim=True) * p
-            y_main[near_neg] = w_n - 2.0 * proj_v - 2.0 * proj_p
-
-        y[:, self.d:, :] = y_main
-        return y
-        
-class Cell(nn.Module):
-    def __init__(self, dim_in: int, hidden: int):
+class GRUContextNav(nn.Module):
+    def __init__(self, C: int, K: int, dropout: float = 0.0):
         super().__init__()
-        self.fc1 = nn.Linear(dim_in, hidden, bias=False) #
-        torch.nn.init.kaiming_uniform_(self.fc1.weight, nonlinearity='relu')
+        self.C, self.K = C, K
+        self.W_h = nn.Linear(C, C)
+        self.W_r = nn.Linear(C, C)           # computed once (kept as in your spec)
+        self.W_z = nn.Linear(C, C)
+        self.U_h = nn.ModuleList([nn.Linear(C, C, bias=False) for _ in range(K)])
+        self.W_init = nn.Linear(C, C)
+        self.U_Z = nn.Linear(C, C, bias=False)
+        self.drop = nn.Dropout(dropout)
+        self.out_ln = nn.LayerNorm(C)
 
-        self.fc2 = nn.Linear(hidden, dim_in, bias=True)
-        torch.nn.init.kaiming_uniform_(self.fc2.weight, nonlinearity='relu')
+    def _ensure_seq(self, base, feats):
+        """
+        Accept:
+          base  : (B,C) or (B,T,C)
+          feats : (B,K,C) or (B,T,K,C)
+        Normalize to:
+          base  -> (B,T,C)
+          feats -> (B,T,K,C)  (broadcast T if missing)
+        """
+        squeeze_time = False
+        if base.dim() == 2:                    # (B,C) -> (B,1,C)
+            base = base[:, None, :]
+            squeeze_time = True
+        elif base.dim() != 3:
+            raise ValueError("base must be (B,C) or (B,T,C)")
 
-        self.act = nn.Softplus()
-    def forward(self, x):
-        return self.fc2(self.act(self.fc1(x))-1)   
+        if feats.dim() == 3:                   # (B,K,C) -> (B,1,K,C), will broadcast over T
+            feats = feats[:, None, :, :]
+        elif feats.dim() != 4:
+            raise ValueError("feats must be (B,K,C) or (B,T,K,C)")
 
-class GRUStyleRefinementAttention(nn.Module):
-    """
-    One-shot GRU-like refinement attention with hierarchical causal synthesis
-    (MuSe × FMMformer) and mild alignment noise (no aux loss).
+        return base, feats, squeeze_time
 
-    Pipeline (single forward pass)
-    ------------------------------
-    0) Projections Q,K,V; multi-head split; LASER on V (exp).
-    1) Seed (fast/low-rank): rank-r EA + Sigmoid + LASER => H0. (unchanged)
-    2) Full attention = Near + Far (causal, hierarchical):
-        • Near-field (level 0): FMMformer-style banded causal blocks of width k0.
-        • Far-field (levels 1..L): per level ℓ, build causal blocks via a segment tree.
-            - Mild aligner (standardize + alignment-conditioned noise) per block/head.
-            - MuSe-style independent clustering of Q and K within the block.
-            - Centroid attention with EA + Sigmoid + LASER, bias b=-log(n_ℓ).
-            - Dipole correction per K-cluster (linear logit augmentation).
-            - Causal aggregation over past (ancestor/previous) blocks only.
-        → Sum near + all far levels to get 	ilde H.
-    3) Head-wise gating (sigmoid) on 	ilde H.
-    4) GRU blend: H_out = (1 - z) * H0 + z * 	ilde H.
+    def forward(self, base: torch.Tensor, feats: torch.Tensor) -> torch.Tensor:
+        base, feats, squeeze_time = self._ensure_seq(base, feats)  # (B,T,C), (B,T,K,C)
+        B, T, K, C = feats.size()
+        assert K == self.K and C == self.C
 
-    Notes
-    -----
-    • No softmax anywhere: EA ((QK^T/√d)^2) + elementwise sigmoid attention + LASER(V).
-    • No Q/K invariance tricks; we rely on mild aligner to stabilize geometry.
-    • Causality enforced at all stages (banded near; triangular past-only for far).
+        ground   = self.W_h(base)        # (B,T,C)
+        criteria = self.W_r(base)        # (B,T,C)  (kept for parity with your sketch)
+        state    = self.W_z(base)        # (B,T,C)
 
-    Config (dict)
-    -------------
-    Required:
-      - n_embd (int), n_heads (int)
-    Optional (defaults in __init__):
-      - block_size (int): not required; used only to cap k0 if provided.
-      - k0 (int): near-field band width (default 128)
-      - levels (int): #hierarchy levels for far-field (default 2)
-      - clusters_per_level (int): C clusters per level per block (default 8)
-      - dipole_weight (float): weight for dipole logit augmentation (default 0.25)
-      - use_alignment_noise (bool): enable mild aligner (default True)
-      - sigma_min, sigma_max, lam, gamma, eps: aligner params
+        # h_hat stack
+        hhat_sum = torch.zeros_like(base)
+        for i in range(K):
+            ui = self.U_h[i](feats[:, :, i, :])       # (B,T,C)
+            hhat_i = torch.tanh(ground + ui)          # (B,T,C)
+            hhat_sum = hhat_sum + hhat_i
 
-    18.8.25 whether or not to apply SpiralMix(q,k,v)-> q,k,_ is uncertain
+        initial = self.W_init(self.drop(hhat_sum))    # (B,T,C)
+
+        # reset gate — FIX 1: no extra dimension
+        reset = torch.sigmoid(state + initial)        # (B,T,C)
+
+        # h_final with reset — FIX 2: multiply in (B,T,C) space
+        h_final = torch.zeros_like(base)
+        for i in range(K):
+            ui = self.U_h[i](reset * feats[:, :, i, :])   # (B,T,C)
+            h_final = h_final + torch.tanh(ground + ui)   # (B,T,C)
+
+        update = torch.sigmoid(state + self.U_Z(initial)) # (B,T,C)
+        result = (1.0 - update) * base + update * h_final
+        result = self.out_ln(result)
+
+        if squeeze_time:
+            result = result[:, 0, :]
+        return result
+
+    @torch.no_grad()
+    def step(self, base_t: torch.Tensor, feats_t: torch.Tensor) -> torch.Tensor:
+        # base_t: (B,C), feats_t: (B,K,C)
+        return self.forward(base_t, feats_t)
+
+class GPTSemanticBlock(nn.Module):
+    def __init__(self, config: GPTConfig):
+        super().__init__()
+        C = config.n_embd
+        self.C = C
+        self.K = config.n_scales
+        self.L = 1 + self.K                    # [K features | base]
+        self.features = SemanticClusterFeaturesCausal(num_scales=self.K, tau=1e-6)
+        self.drop = nn.Dropout(config.dropout)
+        self.ln = nn.LayerNorm(self.C)
+        self.nav = GRUContextNav(C=C, K=self.K, dropout=config.dropout)
     
-    """
+    # vectorized
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: (B,T,C)
+        feats = self.features(x)                      # (B,T,K,C)
+        return self.nav(x, feats)             # returns (B,T,C)
 
-    def __init__(self, config):
-        super().__init__()
-        self.n_embd = config.n_embd
-        self.n_heads = config.n_head
-        assert self.n_embd % self.n_heads == 0, "n_embd must be divisible by n_heads"
-        self.head_dim = self.n_embd // self.n_heads
-
-        # --- Projections ---
-        self.Wq = nn.Linear(self.n_embd, self.n_embd)
-        self.Wk = nn.Linear(self.n_embd, self.n_embd)
-        self.Wv = nn.Linear(self.n_embd, self.n_embd)
-        self.Wo = nn.Linear(self.n_embd, self.n_embd)
-
-        # --- Low-rank seed projections (rank r) ---
-        self.rank = max(16, self.head_dim // 2)
-        self.Pq = nn.Linear(self.n_embd, self.rank, bias=False)
-        self.Pk = nn.Linear(self.n_embd, self.rank, bias=False)
-        self.Pv = nn.Linear(self.n_embd, self.rank, bias=False)
-        self.up_seed = nn.Linear(self.rank, self.n_embd, bias=False)
-
-        # --- Head-wise gating after refinement ---
-        self.gate_u = nn.Parameter(torch.randn(self.n_heads, self.head_dim))  # (H, D)
-        self.gate_b = nn.Parameter(torch.zeros(self.n_heads))
-
-        # --- GRU-style update gate ---
-        self.Wz = nn.Linear(self.n_embd * 4, self.n_embd)
-        self.use_reset_gate = True
-        self.Wr = nn.Linear(self.n_embd * 3, self.n_embd)
-
-        # --- Hierarchy & clustering hyperparams ---
-        self.k0 = 128
-        self.levels = 2
-        self.C = 8
-        self.dipole_weight = 0.25
-
-        # --- Alignment noise (mild aligner) ---
-        self.use_alignment_noise =False
-        self.sigma_min = 0.0
-        self.sigma_max = 1e-2
-        self.lam = 5e-3
-        self.gamma = 1.5
-        self.eps = 1e-4
-
-        # Numerics
-        self.neg_inf = -1e9
-
-    # --------------------------- utils ---------------------------
-    @staticmethod
-    def _shape_heads(x, n_heads):
-        B, T, C = x.shape
-        D = C // n_heads
-        return x.view(B, T, n_heads, D).transpose(1, 2)  # (B,H,T,D)
-
-    @staticmethod
-    def _merge_heads(x):
-        B, H, T, D = x.shape
-        return x.transpose(1, 2).contiguous().view(B, T, H * D)
-
-    @staticmethod
-    def _causal_mask(T: int, device: torch.device):
-        return torch.tril(torch.ones(T, T, dtype=torch.bool, device=device))
-
-    @staticmethod
-    def _band_mask(T: int, device: torch.device, k0: int):
-        idx = torch.arange(T, device=device)
-        diff = idx[None, :] - idx[:, None]
-        # i >= j and within band k0
-        return (diff <= 0) & (diff >= -k0)
-
-    @staticmethod
-    def _segment_tree_blocks(T: int, levels: int) -> List[List[Tuple[int, int]]]:
-        """Return list of levels, each a list of (start,end) half-open index blocks covering [0,T).
-        Level 0 is the whole sequence split into 2^0 blocks? We define:
-          - level 0: fine (near handled separately)
-          - levels 1..L: 2^ℓ blocks of equal size (last block may be shorter)
-        """
-        blocks_per_level: List[List[Tuple[int, int]]] = []
-        for ell in range(1, levels + 1):
-            num = 2 ** ell
-            size = max(1, (T + num - 1) // num)
-            level_blocks = []
-            s = 0
-            for _ in range(num):
-                e = min(T, s + size)
-                if s < e:
-                    level_blocks.append((s, e))
-                s = e
-                if s >= T:
-                    break
-            blocks_per_level.append(level_blocks)
-        return blocks_per_level
-
-    @staticmethod
-    def _kmeans_simple(X: torch.Tensor, C: int, iters: int = 2) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Very small k-means (no-grad). X: (N,D). Returns (centroids[C,D], assign[N])."""
-        N, D = X.shape
-        C = min(C, max(1, N))
-        # init: random subset (deterministic by seeding on N,D,C)
-        with torch.no_grad():
-            idx = torch.linspace(0, N - 1, steps=C, device=X.device).round().long()
-            cent = X[idx].clone()
-            for _ in range(iters):
-                # assign
-                dists = torch.cdist(X, cent, p=2)  # (N,C)
-                assign = dists.argmin(dim=1)
-                # update
-                for c in range(C):
-                    mask = (assign == c)
-                    if mask.any():
-                        cent[c] = X[mask].mean(dim=0)
-            # final assign
-            dists = torch.cdist(X, cent, p=2)
-            assign = dists.argmin(dim=1)
-        return cent, assign
-
-    def _standardize(self, X: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        # per-feature zero-mean, unit-variance (diag) with eps
-        mu = X.mean(dim=0, keepdim=True)
-        Xc = X - mu
-        var = Xc.pow(2).mean(dim=0) + self.eps
-        Xw = Xc / var.sqrt()
-        return Xw, mu, var
-
-    def _align_noise(self, Q_blk: torch.Tensor, K_blk: torch.Tensor, head_seed: int) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Compute standardized Q,K and inject alignment-conditioned Gaussian noise (same at train/infer
-        given deterministic RNG seeded by head_seed). Returns (Qw_noisy, Kw_noisy). Shapes: (t,D).
-        Uses cosine similarity between mean-standardized features to define misalignment.
-        """
-        # standardize (diag)
-        with torch.no_grad():
-            Qw, _, _ = self._standardize(Q_blk)  # (tq, D)
-            Kw, _, _ = self._standardize(K_blk)  # (tk, D)
-            # Cosine similarity between per-block mean feature vectors
-            mq = Qw.mean(dim=0)
-            mk = Kw.mean(dim=0)
-            nq = torch.norm(mq) + 1e-8
-            nk = torch.norm(mk) + 1e-8
-            rho = torch.dot(mq, mk) / (nq * nk)  # in [-1, 1]
-            rho = torch.clamp(rho, -1.0, 1.0)
-            e = (1.0 - rho) * 0.5  # [0,1]
-            sigma2 = self.sigma_min ** 2 + self.lam * (float(e) ** self.gamma)
-            sigma2 = float(min(self.sigma_max ** 2, max(self.sigma_min ** 2, sigma2)))
-        # deterministic noise
-        g = torch.Generator()
-        g.manual_seed(int(head_seed))
-        noise_q = torch.normal(mean=0.0, std=math.sqrt(sigma2), size=Q_blk.shape, generator=g, device=Q_blk.device)
-        noise_k = torch.normal(mean=0.0, std=math.sqrt(sigma2), size=K_blk.shape, generator=g, device=K_blk.device)
-        return Qw + noise_q, Kw + noise_k
-
-    # --------------------------- forward ---------------------------
-    def forward(self, x: torch.Tensor, attn_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
-        B, T, C = x.shape
-        assert C == self.n_embd
-        device = x.device
-
-        # Projections
-        Q = self.Wq(x)
-        K = self.Wk(x)
-        V = self.Wv(x)
-
-        # Multi-head split
-        Qh = self._shape_heads(Q, self.n_heads)  # (B,H,T,D)
-        Kh = self._shape_heads(K, self.n_heads)
-        Vh = self._shape_heads(V, self.n_heads)
-        Vh_exp = torch.exp(Vh)  # LASER
-
-        # Global sigmoid-attn bias for stability per sequence length
-        b_scalar = -math.log(max(T, 1))
-
-        # ---------------- 1) Seed: low-rank EA+Sigmoid+LASER -> H0 ----------------
-        Qr = self.Pq(Q)              # (B,T,r)
-        Kr = self.Pk(K)              # (B,T,r)
-        Vr = self.Pv(V)              # (B,T,r)
-        Vr_exp = torch.exp(Vr) #overcome
-        S_seed = (Qr @ Kr.transpose(1, 2))
-        S_seed.mul_(1.0 / math.sqrt(self.rank))
-        causal = self._causal_mask(T, device) if attn_mask is None else attn_mask.to(torch.bool)
-        S_seed.masked_fill_(~causal[None, :, :], self.neg_inf)
-        S_seed.add_(b_scalar).sigmoid_()
-        H0_r = S_seed @ Vr_exp
-        H0 = self.up_seed(H0_r)  # (B,T,C)
-
-        # ---------------- 2) Full attention: Near + Far (hierarchical causal) ----------------
-        # Near-field (level 0): banded causal mask width k0
-        k0 = min(self.k0, T - 1)
-        near_mask = self._band_mask(T, device, k0) & causal
-        logits_near = (Qh @ Kh.transpose(-2, -1)) / math.sqrt(self.head_dim)
-        #logits_near = logits_near * logits_near
-        logits_near = logits_near.masked_fill(~near_mask[None, None, :, :], self.neg_inf)
-        A_near = torch.sigmoid(logits_near + b_scalar)
-        H_near_h = A_near @ Vh_exp  # (B,H,T,D)
-
-        # Far-field hierarchical levels
-        H_far_total_h = torch.zeros_like(H_near_h)
-        blocks_per_level = self._segment_tree_blocks(T, self.levels)
-
-        for ell, level_blocks in enumerate(blocks_per_level, start=1):
-            # per-level bias uses block-level size for stability
-            for b in range(B):
-                for h in range(self.n_heads):
-                    Q_all = Qh[b, h]  # (T,D)
-                    K_all = Kh[b, h]
-                    Vexp_all = Vh_exp[b, h]
-
-                    for (s, e) in level_blocks:
-                        # query block indices [s,e), keys allowed are strictly in the past excluding near band
-                        if s >= e:
-                            continue
-                        # Keys: union of earlier positions not covered by near band
-                        # We'll take all j < s minus the recent k0 window (far-only region)
-                        j_end = s
-                        j_start = 0
-                        if j_end <= 0:
-                            continue
-                        key_idx_full = torch.arange(j_start, j_end, device=device)
-                        if k0 > 0:
-                            key_idx_far = key_idx_full[:-k0] if j_end - j_start > k0 else key_idx_full[:0]
-                        else:
-                            key_idx_far = key_idx_full
-                        if key_idx_far.numel() == 0:
-                            continue
-
-                        q_blk = Q_all[s:e]  # (tq,D)
-                        k_blk = K_all[key_idx_far]  # (tk,D)
-                        v_blk = Vexp_all[key_idx_far]  # (tk,D)
-
-                        # --- Mild aligner: standardize + alignment-conditioned noise (optional) ---
-                        if self.use_alignment_noise:
-                            head_seed = (b + 1) * 1_000_003 + (h + 1) * 911 + (ell + 1) * 97 + (s + 1)
-                            q_std, k_std = self._align_noise(q_blk, k_blk, head_seed=head_seed)
-                        else:
-                            q_std, _, _ = self._standardize(q_blk)
-                            k_std, _, _ = self._standardize(k_blk)
-
-                        # --- Independent clustering (MuSe-style) on standardized spaces ---
-                        # Queries clustered within block, keys clustered over far region
-                        Cq = min(self.C, max(1, q_std.size(0)))
-                        Ck = min(self.C, max(1, k_std.size(0)))
-                        with torch.no_grad():
-                            cq, q_assign = self._kmeans_simple(q_std, Cq, iters=2)
-                            ck, k_assign = self._kmeans_simple(k_std, Ck, iters=2)
-                        # Centroid values: average V within each K-cluster (LASER already applied)
-                        # Vectorized centroids and dipoles (no Python loops)
-                        one_hot = torch.nn.functional.one_hot(k_assign, num_classes=Ck).to(v_blk.dtype)  # (tk, Ck)
-                        count = one_hot.sum(dim=0).clamp_min(1.0)                                       # (Ck,)
-                        v_cent = (one_hot.T @ v_blk) / count[:, None]                                    # (Ck, Dv)
-                        
-                        ck_assigned = ck[k_assign]                                                       # (tk, Dk)
-                        resid = k_std - ck_assigned                                                      # (tk, Dk)
-                        dipole = (one_hot.T @ resid) / count[:, None]            
-
-                        # Coarse EA logits on centroids (queries vs key-centroids)
-                        S = (q_std @ ck.t()) / math.sqrt(self.head_dim)
-                        # Dipole linear augmentation (small)
-                        if self.dipole_weight != 0.0:
-                            S = S + self.dipole_weight * ((q_std @ dipole.t()) / math.sqrt(self.head_dim))
-
-                        # Sigmoid attention with per-level bias
-                        b_level = -math.log(max(ck.size(0), 1))
-                        A = torch.sigmoid(S + b_level)
-
-                        # Aggregate to values
-                        H_blk = A @ v_cent  # (tq,D)
-                        # Scatter-add into H_far_total_h[b,h,s:e,:]
-                        H_far_total_h[b, h, s:e] += H_blk
-
-               # Sum near and far
-        H_refine_h = H_near_h + H_far_total_h
-        
-        # ---------------- 3) Head-wise gated attention on refined path ----------------
-        gate_scores = torch.einsum('bhtd,hd->bht', Qh, self.gate_u) + self.gate_b[None, :, None]
-        H_refine_h = H_refine_h * torch.sigmoid(gate_scores)[..., None]
-        Ht = self._merge_heads(H_refine_h)  # single merge
-
-        # ---------------- 4) GRU-style blend ----------------
-        if self.use_reset_gate:
-            r = torch.sigmoid(self.Wr(torch.cat([Q, K, H0], dim=-1)))
-            Ht = r * Ht
-        z = torch.sigmoid(self.Wz(torch.cat([Q, K, H0, Ht], dim=-1)))
-        H_out = (1.0 - z) * H0 + z * Ht
-
-        return self.Wo(H_out)
-
-
-
-class Decoder(nn.Module):
-    def __init__(self, config):
-        super().__init__()
-        self.ln = nn.LayerNorm(config.n_embd)
-        self.encoder  = Cell(config.n_embd,config.n_embd*2)
-        self.distance_encoder_learned = PhaseTransport(1) #PhaseTap(d)
-        self.decoder  = Cell(config.n_embd,config.n_embd*2)
-
-        self.attn = GRUStyleRefinementAttention(config)
-        self.dropout = nn.Dropout(config.dropout)
-    def forward(self, x):
-        B,T,C= x.shape
-        w = self.ln(x)
-        a = self.distance_encoder_learned(w)
-        x = x + self.dropout(self.encoder(a))
-        x = x + self.dropout(self.decoder(x + self.attn(a)))
-        return x
-
+    # single-step incremental
+    @torch.no_grad()
+    def step(self, x_t: torch.Tensor, feat_state: CausalPyramidState) -> torch.Tensor:
+        feats_t = self.features.step(x_t, feat_state)  # (B,K,C)
+        return self.nav.step(x_t, feats_t)           # (B,C)
 
 
 class FixedEmbedding(nn.Module):
@@ -735,6 +416,7 @@ class GPTConfig:
     n_layer: int = 6
     n_head:int = 6
     n_embd: int = 128
+    n_scales:int = 9
     dropout: float = 0.1
 
 class GPT(nn.Module):
@@ -747,11 +429,10 @@ class GPT(nn.Module):
 
         self.transformer = nn.ModuleDict(dict(
             wte = FixedEmbedding(config),
-            h = nn.ModuleList([Decoder(config) for _ in range(config.n_layer)]),
+            h = nn.ModuleList([GPTSemanticBlock(config) for _ in range(config.n_layer)]),
         ))
        
         self.lm_head = nn.Linear(self.config.n_embd, self.config.vocab_size, bias=False)
-        self.lm_head.weight = self.transformer.wte.weight #weight tying in-out
 
 
     # ---------- forward ----------
@@ -761,9 +442,9 @@ class GPT(nn.Module):
         x = self.transformer.wte(idx) 
         x = x.detach()                 # sever any stale history just in case
         x.requires_grad_(True)         # make x a grad leaf for τ at layer 0
+
         for block in self.transformer.h:
                 x= block(x)
-
         
         if targets is not None:
             logits = self.lm_head(x)
@@ -776,3 +457,45 @@ class GPT(nn.Module):
             logits = self.lm_head(x[:, [-1], :])
             loss = None
         return logits, loss
+
+
+    @torch.no_grad()
+    def generate_greedy(model: nn.Module, idx: torch.LongTensor, max_new_tokens: int, block_size: int):
+        """
+        model: your GPT with:
+           - transformer.wte (embedding)
+           - transformer.h : list[GPTSemanticBlock]
+           - lm_head
+        idx: (B, T0) prompt token ids
+        """
+        device = next(model.parameters()).device
+        B = idx.size(0)
+        # per-block feature caches
+        feat_states = [CausalPyramidState(model.config.n_scales, model.config.n_embd, device, batch_size=B)
+                       for _ in model.transformer.h]
+    
+        # 1) prime caches with the prompt (causal, one step at a time)
+        x_all = model.transformer.wte(idx)  # (B,T0,C); fixed embeddings in your code
+        for t in range(idx.size(1)):
+            x_t = x_all[:, t, :]
+            for blk, st in zip(model.transformer.h, feat_states):
+                x_t = blk.step(x_t, st)      # per-block step
+            # we discard logits during priming
+    
+        # 2) roll out new tokens
+        out = [idx]
+        cur = idx
+        for _ in range(max_new_tokens):
+            # last token embedding
+            last_idx = cur[:, -1]                      # (B,)
+            x_t = model.transformer.wte(last_idx)      # (B,C)
+            for blk, st in zip(model.transformer.h, feat_states):
+                x_t = blk.step(x_t, st)                # (B,C)
+            logits = model.lm_head(x_t)                # (B,V)
+            next_idx = torch.argmax(logits, dim=-1, keepdim=True)  # greedy; swap to sampling if you like
+            out.append(next_idx)
+            cur = torch.cat([cur, next_idx], dim=1)
+            # keep only last block_size tokens in cur (typical AR convenience)
+            if cur.size(1) > block_size:
+                cur = cur[:, -block_size:]
+        return torch.cat(out, dim=1)
