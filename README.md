@@ -1,110 +1,192 @@
-#### On the Structural Limits of Attention: Eight Failure Modes and a Phase-Transport Multiscale Alternative
-# Abstract
+# On the Structural Limits of Attention: Eight Failure Modes and a Phase-Transport Multiscale Alternative
 
-We catalog eight structural failure modes of attention-based sequence models that persist despite scale, data, and modern efficiency tricks. The problems originate from (i) the foundational partition imposed by tokenization, (ii) computational scaling of pairwise mixing, (iii) the absence of intrinsic multi-scale structure, (iv) geometric rather than semantic partitioning, (v) dynamic context collapse under autoregressive training, (vi) in-place evolution of internal representations that erases early conditioning, (vii) preconditioning decay with depth, and (viii) the continuous-decoder limitation (MLPs as phase shifters/codebooks that cannot implement discrete selection). We review near/far-field attention (FMMformer) and multipole clustering (MuSe), which address cost but not structure
+## Abstract
 
-FMMformer
+We catalog eight structural failure modes of attention-based sequence models that persist even as we scale data, parameters, and engineering tricks. The failures arise from (1) the foundational partition imposed by tokenization, (2) the computational scaling of pairwise mixing, (3) the absence of intrinsic multi-scale structure, (4) geometric rather than semantic partitioning, (5) dynamic context collapse under autoregressive training, (6) in-place evolution of internal representations, (7) preconditioning decay with depth, and (8) the continuous-decoder limitation (MLPs as phase shifters/codebooks that cannot implement discrete selection). We review near/far-field attention (e.g., FMM-like decompositions) and multipole clustering (e.g., MuSe), which reduce cost but not structural deficiency. We then propose a causal, dyadic phase-transport feature pyramid that encodes token-to-token and sequence-to-sequence relations at multiple granularities, plus small, explicit “decision slots” for persistent plan/state. This reframes the problem from on-the-fly discovery to signal encoding, shrinking the semantic search budget. The remaining obstacle is selection: replacing uniformized, continuous blending with decisive, persistent routing across multiscale signals.
 
-2509.10406v2
+---
 
-. We then outline a causal, dyadic phase-transport feature pyramid that encodes token-to-token and sequence-to-sequence relations at multiple granularities, plus small, explicit decision slots for persistent plan/state. This architecture reduces semantic search cost but still inherits the selection problem: equal-importance blending across slices. We close by discussing how these failure modes reinforce one another and what a principled “final act” must provide.
+## 1. Introduction
 
-1. Introduction
+Transformer attention mixes all past positions based on content. Its striking capabilities emerge largely from excess capacity and extensive conditioning on data, not from built-in mechanisms that discover, choose, and enforce semantic partitions. When examined through a signal-processing lens, attention is a high-bandwidth, continuous mixing operator applied to a discretized stream. The eight failure modes below explain why transformers often yield fluent but shallow outputs, why efficiency tricks help but do not cure brittleness, and why a structural rethink that encodes relations as signals (rather than re-discovering them) may be preferable.
 
-Transformer attention is a powerful continuous mixing operator for sequences. However, its apparent “reasoning” arises largely from excess capacity conditioned by vast experience, not from structural mechanisms that discover, choose, and enforce semantic partitions on the fly. We articulate eight concrete limits that hold back intrinsic structure, explain how they interact, examine efficiency-focused remedies, and propose a multiscale, purely causal alternative that relocates—but does not yet solve—the core problem of selection.
+---
 
-2. Background (signal-processing lens)
+## 2. The Eight Failure Modes (with detailed reasoning)
 
-Self-attention computes content-dependent mixing via 
-𝑄
-𝐾
-⊤
-QK
-⊤
- scores, normalized and applied to 
-𝑉
-V. Efficiency variants decompose interactions into near-field (local, exact) and far-field (coarse, low-rank/clustered) terms. FMMformer realizes a banded + low-rank split inspired by the Fast Multipole Method
+### Failure 1 — Foundational partition (tokenization)
 
-FMMformer
+**What it is.** Tokenization decides the atomic units before any learning begins. Attention must relate these fixed atoms; it cannot redefine them.
 
-; MuSe clusters keys and queries (separately) and adds multipole (monopole+dipole) corrections to approximate softmax attention in pretraining
+**Why it exists.** Practical training requires discrete indices to map bytes/characters to vectors. Once chosen, these boundaries constrain all subsequent representation learning.
 
-2509.10406v2
+**Consequences.** Higher-level units (morphemes, words, phrases) become emergent patterns over subword grids. Semantics are smeared across multiple tokens. The model spends capacity reconstructing units it was never given natively.
 
-.
+**Reinforcement.** This feeds Failure 3 (no explicit multi-scale) and Failure 4 (geometric, not semantic partitions), because any hierarchy that follows is built on a subword lattice rather than task-induced units.
 
-While these reduce cost, they do not give the model an internal, learned semantic partition controller; partitions remain geometric, externally fixed or weakly adapted, and selection across partitions remains continuous and uniformized.
+**Intuition.** If your ruler marks are wrong, every later measurement inherits that bias.
 
-3. Eight failure modes
-F1 — Foundational partition (tokenization)
+---
 
-Tokenization sets the atomic units ex ante. Attention cannot evolve “semantic atoms”; it only relates pre-discretized units. Higher structures (words, clauses, motifs) are emergent, noisy, and hostage to the subword grid.
+### Failure 2 — Quadratic pairwise cost
 
-F2 — Quadratic pairwise cost
+**What it is.** Full attention compares a query to all prior keys. Cost scales with the square of sequence length.
 
-Full attention scales as 
-𝑂
-(
-𝑇
-2
-𝐷
-)
-O(T
-2
-D). Even with memory-efficient kernels or flash implementations, compute remains quadratic. Efficient splits (sparse, low-rank, FMM-like) trade accuracy/structure for speed
+**Why it exists.** Attention is a dense, global operator by design: all-to-all content-dependent mixing.
 
-FMMformer
+**Consequences.** Long contexts are expensive. We either truncate, sparsify, approximate, or pay the bill. Efficiency methods optimize memory and flops but leave semantics untouched.
 
-.
+**Reinforcement.** The urge to prune leads to geometric shortcuts (Failure 4), which further disconnect partitions from meaning.
 
-F3 — No intrinsic multi-scale structure
+**Intuition.** A room where everyone talks to everyone is expressive—but noisy and costly. Microphones help; they don’t create an agenda.
 
-Standard stacks do not provide an explicit hierarchy that decides when local syntax vs. global narrative dominates. Heads act as static geometric projections; “scale” is not a first-class control variable.
+---
 
-F4 — Geometric, not semantic partitioning
+### Failure 3 — No intrinsic multi-scale structure
 
-Windowing, striding, clustering, and low-rank approximations define spatial/geometric partitions. They are not learned semantic groupings tied to task or context; thus partition quality is incidental.
+**What it is.** Standard blocks don’t provide a native hierarchy that says when local syntax should dominate and when global narrative should.
 
-F5 — Dynamic context collapse (autoregressive)
+**Why it exists.** Heads are fixed-dimensional projections. Layers stack depth-wise, but there is no structural mechanism that declares “this layer owns syllables, the next owns words,” etc. Scales are not first-class citizens.
 
-At step 
-𝑡
-t, the model must learn importance over 
-[
-1..
-𝑡
-−
-1
-]
-[1..t−1]. Softmax normalization equalizes competition across a variable-sized set, pushing solutions toward uniform/diffuse weighting for long contexts and over-sharp local bias for short ones—local overfit, global underfit.
+**Consequences.** The model must infer multi-scale structure implicitly every time. Early in training it latches onto short loops (repetition), while global consistency remains weak. Later, it may become fluent yet shallow: grammatically smooth but semantically undercommitted.
 
-F6 — In-place evolution of representations
+**Reinforcement.** Failure 1 fixes atoms at the wrong level, Failure 2 pushes us to prune globally, and the absence of an explicit hierarchy multiplies the difficulty of learning stable long-range dependencies.
 
-Residual/FFN updates rewrite the vector manifold in place each layer. Early structure (even if carefully injected) is continuously transformed, so fixed partitioning or conditioning at the input does not persist.
+**Intuition.** Without a map’s zoom levels, navigation alternates between too much detail and not enough context.
 
-F7 — Preconditioning failure with depth
+---
 
-External structure (positional tags, masks, distance features) dissipates with depth unless re-injected. The system keeps “re-discovering” structure rather than carrying it forward explicitly.
+### Failure 4 — Geometric, not semantic partitioning
 
-F8 — Continuous-decoder limitation (MLPs as phase shifters)
+**What it is.** Windows, strides, buckets, clusters, low-rank factors—all define partitions via position or geometry rather than meaning.
 
-Within a block, attention “decides where to shift,” while the MLP executes the shift—i.e., it is a codebook/phase transformer implementing smooth affine/polynomial maps. Such continuous decoders do sorting, scaling, fitting, but not symbolic selection/branching. Discrete control remains out of reach without extra machinery.
+**Why it exists.** Efficient schemes must be simple and general: they gate by distance, block, or cluster centroids. True semantic grouping is input- and task-dependent and thus hard to specify cheaply.
 
-4. How they reinforce one another
+**Consequences.** The model receives partitions that are easy to compute but misaligned with semantic units. It then must repair this mismatch through capacity and data rather than structure.
 
-F1 → F3/F4: Fixed tokens nudge all multi-scale strategies to be geometric; semantics can’t become first-class.
+**Reinforcement.** Failures 2 and 3 encourage such geometric partitions; Failure 5 (equalizing pressure) then washes out any tentative semantic signal.
 
-F2 → F4/F5: To cut cost, we prune structure geometrically; softmax over variable field sizes then collapses importance globally.
+**Intuition.** Cutting a novel into five-page chunks is convenient for printing, not for understanding its themes.
 
-F6/F7 → F8: As layers rewrite the manifold, preconditioning decays; the only persistent operator (MLP) is continuous, so selection reverts to blending.
+---
 
-F5 + F8: Equal-importance pressure meets continuous decoding → coherent fluency without commitment (grammatical, semantically shallow).
+### Failure 5 — Dynamic context collapse (autoregressive equal-importance pressure)
 
-5. Prior efficiency remedies & their limits
+**What it is.** At time t, losses equally weight predictions made with drastically different history sizes (from one token to thousands). Softmax normalization across a variable-size field tends to equalize competition.
 
-FMMformer decomposes attention into banded near-field + low-rank far-field, achieving linear complexity and good accuracy, but the split is still geometric and fixed relative to the sequence grid
+**Why it exists.** Autoregressive training computes a per-token loss; attention normalizes scores over all available past tokens. As t grows, the denominator grows, diffusing attention; when t is small, sharp pairwise correlations dominate.
 
-FMMformer
+**Consequences.** Local overfit (repetition loops, echoing) early; global underfit (diffuse, noncommittal) later. Adding more past often adds noise, not signal.
 
-.
-MuSe performs query/key clustering and multipole (monopole/dipole) approximations, gaining runtime speedups at long contexts and acceptable loss increases, but it still externalizes partition choice and performs continuous weighting across clusters
+**Reinforcement.** This interacts with Failure 8 (continuous decoders) to promote blending over choosing; with Failure 3, it impedes robust multi-scale control.
+
+**Intuition.** If you must weigh a handful of items and a warehouse with the same scale, you won’t measure either well.
+
+---
+
+### Failure 6 — In-place evolution of representations
+
+**What it is.** Each layer rewrites the current vector space. Residual connections add new signals while preserving the old coordinates; the manifold itself drifts layer by layer.
+
+**Why it exists.** Residual MLPs and attention are affine updates in the same space. There is no explicit mechanism to preserve tagged structure across depth.
+
+**Consequences.** Any structure injected at the input (special tags, distances) is re-encoded repeatedly and loses legibility. Downstream layers must re-derive what upstream once knew.
+
+**Reinforcement.** Fuels Failure 7 (preconditioning decay) and amplifies Failure 8 (decoders default to smooth blends when structure is ambiguous).
+
+**Intuition.** Redrawing the map after every turn makes early annotations unreliable.
+
+---
+
+### Failure 7 — Preconditioning decay with depth
+
+**What it is.** Externally injected structure (positional tags, hierarchy hints, distance features) fades unless reintroduced at every stage.
+
+**Why it exists.** Without a persistent channel reserved for structure, generic mixing erodes explicit signals. Depth acts like a lowpass on tags that aren’t protected.
+
+**Consequences.** The model spends compute re-discovering the same relations. Training feels like pushing a boulder uphill: every layer forgets what the last layer wrote.
+
+**Reinforcement.** Coupled with Failure 6, this ensures that any initial semantic scaffolding dissolves unless maintained explicitly.
+
+**Intuition.** Sticky notes fall off during a long trip unless you keep re-sticking them.
+
+---
+
+### Failure 8 — Continuous-decoder limitation (MLPs as phase shifters/codebooks)
+
+**What it is.** Within a block, attention decides where information should move; the MLP executes the move as a continuous transform (codebook). MLPs can sort, scale, and fit polynomials, but they do not natively implement discrete selection or branching.
+
+**Why it exists.** Feedforward nets are universal approximators of continuous maps. Discrete control (symbolic routing, hard selection) is not their native operation; it emerges only statistically with large capacity and data.
+
+**Consequences.** The system blends competing signals rather than committing. It yields fluent, grammatical outputs that can lack semantic backbone or long-horizon consistency.
+
+**Reinforcement.** Combined with Failure 5, this leads to “equal-importance blending”; with Failures 6–7, any early discrete hints get washed into smooth averages.
+
+**Intuition.** A mixing board can balance channels exquisitely, but it cannot decide which instrument should play the solo.
+
+---
+
+## 3. How the failures entangle
+
+* **F1 → F3/F4.** Fixed atoms force emergent hierarchy; practical partitions become geometric.
+* **F2 → F4/F5.** Cost pressures prefer simple partitions and uniform normalization, encouraging equal-importance behavior.
+* **F6 → F7/F8.** In-place rewrites cause structural drift; continuous decoders prefer blending as legibility degrades.
+* **F5 + F8.** Variable-field normalization meets continuous decoding, yielding “coherent fluency without commitment.”
+
+---
+
+## 4. Prior efficiency remedies (what they fix, what they don’t)
+
+* **Near/Far-field decompositions (FMM-like).** Split attention into banded local and low-rank global terms. This reduces compute, not the structural absence of semantic hierarchy. Partitions remain geometric and fixed relative to the grid.
+* **Multipole semantic clustering (e.g., MuSe).** Cluster queries and keys separately; approximate cluster interactions with monopole/dipole summaries. Improves runtime at long context with small quality loss, but selection across clusters remains continuous, and partition choice remains external to semantics.
+
+**Bottom line:** These address Failure 2 (cost) and nibble at Failure 3 (some hierarchical flavor) but leave Failures 4–8 largely intact.
+
+---
+
+## 5. A multiscale, phase-transport alternative (causal, dyadic, streaming)
+
+**Goal.** Re-express relations as explicit signals so the model computes over encoded structure instead of re-discovering it every step.
+
+**Token–token phase transport (scale 1).** Compute a guarded, phase-preserving delta between consecutive embeddings. Guards handle near-zero vectors and antipodal cases; the result carries direction-of-change information.
+
+**Sequence–sequence phase transport (higher scales).** Build a dyadic, causal pyramid of centroids over blocks of size 2, 4, 8, … For each scale, compute a phase-transport delta between the current block centroid and the previous block centroid. Broadcast these per-block features to positions inside the block. This yields a stacked feature tower per token: local change plus multi-scale, sequence-level change.
+
+**Streaming state.** Maintain ring buffers per level so updates are O(scales) per token. Early-region masking ensures causal safety at boundaries.
+
+**Decision slots (persistent plan/state).** Reserve small sub-vectors carried alongside the main stream where the model can “write” commitments (theme, plan, speaker, constraint) and “read” them later. These slots are the place to keep decision trees—lightweight persistent state that survives layer drift.
+
+**Decoding.** Predict over the slice of the current representation; the multiscale tower and slots inform the distribution without quadratic attention.
+
+**What this improves.** Cuts semantic search cost, provides explicit multi-scale signals, and introduces persistent memory for choices.
+
+**What it doesn’t.** It does not, by itself, solve selection. Without a discrete or sharply sparse controller, the system still tends toward continuous blending across scales.
+
+---
+
+## 6. Computational considerations
+
+* **Training (vectorized):** Linear in sequence length per scale; with logarithmic number of scales, total cost scales like T times log T for feature construction.
+* **Inference (streaming):** O(scales) per token via ring buffers; practical and cache-friendly.
+* **Boundary handling:** Power-of-two blocks avoid partial centroids; masks cover early regions; optional dual-offset trees can reduce left-bias artifacts.
+
+---
+
+## 7. Epistemic axiom: information as embedded meta-vector
+
+We adopt a simple operational axiom: information is only information insofar as it is embedded as a coordinate in some manifold. Numbers are meaningful as positions on a pre-encoded axis; language tokens are meaningful as coordinates in a learned space. Phase-transport works because embeddings are literal coordinates; relations can be encoded as stable geometric transforms.
+
+---
+
+## 8. Outlook: the missing piece (selection)
+
+All roads lead to selection. A satisfactory controller must:
+
+* Choose among multi-scale features without imposing equal-importance normalization across variable fields.
+* Persist choices across time (so plans survive depth and layer drift).
+* Remain computationally light.
+
+Absent this, the eight failures are merely relocated: from token mixing to signal mixing. The multiscale, phase-transport tower plus decision slots sets the stage; the final act is decisiveness.
+
+
+*(Citations omitted here for format; see accompanying notes for specific works.)*
