@@ -20,7 +20,7 @@ Transformer models mix positions based on content, and their capability as predi
 
 **Why it exists.** Practical training requires discrete indices to map bytes/characters to vectors. Once chosen, these boundaries constrain all subsequent representation learning.
 
-**Consequences.** Higher-level units (morphemes, words, phrases) become emergent patterns over subword grids. Semantics are smeared across multiple tokens. The model spends capacity reconstructing units it was never given natively.
+**Consequences.** Higher-level units (morphemes, words, phrases) become emergent patterns over subword grids. Semantics are smeared across multiple tokens. The model spends capacity reconstructing units it was never given natively. If “semantic atoms” are misaligned with task units, the model must first reconstruct those atoms statistically before it can use them—spending capacity on rediscovery rather than reasoning.
 
 **Reinforcement.** This feeds Failure 3 (no explicit multi-scale) and Failure 4 (geometric, not semantic partitions), because any hierarchy that follows is built on a subword lattice rather than task-induced units.
 
@@ -76,7 +76,7 @@ Transformer models mix positions based on content, and their capability as predi
 
 **Why it exists.** Autoregressive training computes a per-token loss; attention normalizes scores over all available past tokens. As t grows, the denominator grows, diffusing attention; when t is small, sharp pairwise correlations dominate.
 
-**Consequences.** Local overfit (repetition loops, echoing) early; global underfit (diffuse, noncommittal) later. Adding more past often adds noise, not signal.
+**Consequences.** Local overfit (repetition loops, echoing) early; global underfit (diffuse, noncommittal) later. Adding more past often adds noise, not signal. Reappearance outside attention. The same equal-importance pressure re-emerges when multiscale meta-signals are stacked (e.g., scale-1/2/4/… features): continuous mixers tend to blend scales uniformly unless a selector breaks symmetry.
 
 **Reinforcement.** This interacts with Failure 8 (continuous decoders) to promote blending over choosing; with Failure 3, it impedes robust multi-scale control.
 
@@ -90,7 +90,7 @@ Transformer models mix positions based on content, and their capability as predi
 
 **Why it exists.** Residual MLPs and attention are affine updates in the same space. There is no explicit mechanism to preserve tagged structure across depth.
 
-**Consequences.** Any structure injected at the input (special tags, distances) is re-encoded repeatedly and loses legibility. Downstream layers must re-derive what upstream once knew.
+**Consequences.** Any structure injected at the input (special tags, distances) is re-encoded repeatedly and loses legibility. Downstream layers must re-derive what upstream once knew. This drift converts crisp tags into distributed hints; without protected channels, later layers inherit only a shadow of early structure.
 
 **Reinforcement.** Fuels Failure 7 (preconditioning decay) and amplifies Failure 8 (decoders default to smooth blends when structure is ambiguous).
 
@@ -137,7 +137,7 @@ Transformer models mix positions based on content, and their capability as predi
 
 ## 4: Prior Efficacy Remedies (for integration)
 
-This section reframes “prior efficiency remedies” as **prior efficacy remedies**: a survey of methods that improved *how well* models process long sequences or reduce compute/latency, while highlighting **which structural problems they do—and do not—address**. The theme: most advances optimize *how information is moved*, not *how information is chosen*. They close performance gaps by lowering the semantic search budget or stabilizing training, but leave selection and semantic partitioning largely unresolved. they constrain geometry, linearize cost, stabilize gradients, and bias toward useful long-range patterns. Yet, across families, the core limitations remain: partitions are still **geometric**, selection is **continuous blending**, structure **drifts in place**, and preconditioning **fades with depth**. They elevate efficacy, not structural semantics. 
+This survey shows many ways to move information better (scale, speed, stability), but very few ways to choose information better. They narrow the search budget and close benchmark gaps—but leave partitioning geometric, selection continuous, structure drifting, and preconditioning fading.he theme: most advances optimize *how information is moved*, not *how information is chosen*. They close performance gaps by lowering the semantic search budget or stabilizing training, but leave selection and semantic partitioning largely unresolved. they constrain geometry, linearize cost, stabilize gradients, and bias toward useful long-range patterns. Yet, across families, the core limitations remain: partitions are still **geometric**, selection is **continuous blending**, structure **drifts in place**, and preconditioning **fades with depth**. They elevate efficacy, not structural semantics.  
 
 ---
 
@@ -282,9 +282,9 @@ Legend: **✓✓** strong improvement, **✓** moderate, (±) partial/indirect, 
 
 ---
 
-## 7. Epistemic axiom: information as embedded meta-vector
+## 7. Epistemic axioms: information as embedded meta-vector
 
-We adopt a simple operational axiom: information is only information insofar as it is embedded as a coordinate in some manifold. Numbers are meaningful as positions on a pre-encoded axis; language tokens are meaningful as coordinates in a learned space. Phase-transport works because embeddings are literal coordinates; relations can be encoded as stable geometric transforms.
+We adopt the following operational axioms: information is only information insofar as it is embedded as a coordinate in some manifold. Numbers are meaningful as positions on a pre-encoded axis; language tokens are meaningful as coordinates in a learned space. Phase-transport can work if embeddings are literal coordinates; relations can be encoded as stable geometric transforms. We must consider that the model computes while the information thinks: intelligence-like behavior emerges out of relational structure and latent procession in a compute fabric.  Epistemic acquisition, then, is the process of encoding relations so that downstream computation can evolve them predictably. The system improves not by uncovering truth at inference time, but by making structure explicit before mixing.
 
 ---
 
