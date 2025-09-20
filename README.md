@@ -1,5 +1,5 @@
-####On the Structural Limits of Attention: Eight Failure Modes and a Phase-Transport Multiscale Alternative
-#Abstract
+#### On the Structural Limits of Attention: Eight Failure Modes and a Phase-Transport Multiscale Alternative
+# Abstract
 
 We catalog eight structural failure modes of attention-based sequence models that persist despite scale, data, and modern efficiency tricks. The problems originate from (i) the foundational partition imposed by tokenization, (ii) computational scaling of pairwise mixing, (iii) the absence of intrinsic multi-scale structure, (iv) geometric rather than semantic partitioning, (v) dynamic context collapse under autoregressive training, (vi) in-place evolution of internal representations that erases early conditioning, (vii) preconditioning decay with depth, and (viii) the continuous-decoder limitation (MLPs as phase shifters/codebooks that cannot implement discrete selection). We review near/far-field attention (FMMformer) and multipole clustering (MuSe), which address cost but not structure
 
