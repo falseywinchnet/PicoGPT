@@ -138,6 +138,8 @@ Transformer models mix positions based on content, and their capability as predi
 
 **intuition.** muscle memory of a snail vs an elephant
 
+Caveat: Coordinates give it shape (vector value), but position ties it to an identity within a larger whole. Strip away position, and you strip away the distinguishability that makes it retrievable and durable. But give it back an explicit sequential label and it will easily be treated as memorization. 
+
 
 ## 3. How the failures entangle
 
