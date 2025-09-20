@@ -8,7 +8,7 @@ We catalog eight structural failure modes of sequential language prediction mode
 
 ## 1. Introduction
 
-Transformer attention mixes all past positions based on content. Its striking capabilities emerge largely from excess capacity and extensive conditioning on data, not from built-in mechanisms that discover, choose, and enforce semantic partitions. When examined through a signal-processing lens, attention is a high-bandwidth, continuous mixing operator applied to a discretized stream. The eight failure modes below explain why transformers often yield fluent but shallow outputs, why efficiency tricks help but do not cure brittleness, and why a structural rethink that encodes relations as signals (rather than re-discovering them) may be preferable.
+Transformer models mix positions based on content, and their capability as predictors(and therefore generators) of useful text, emerge largely from excess capacity and extensive conditioning on data, not from built-in mechanisms that discover, choose, and enforce semantic partitions. When examined through a signal-processing lens, attention is a high-bandwidth, continuous mixing operator applied to a discretized stream. The eight failure modes below explain why transformers often yield fluent but shallow outputs, why efficiency tricks help but do not cure brittleness, and why a structural rethink that encodes relations as signals (rather than re-discovering them) may be preferable.
 
 ---
 
