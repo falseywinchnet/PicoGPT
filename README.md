@@ -126,6 +126,19 @@ Transformer models mix positions based on content, and their capability as predi
 
 ---
 
+### Failure 9 — Local pattern erosion vs. memorization
+
+**What it is.** Models pass through a stage where genuine local predictive skill (e.g., character continuity, morpheme consistency, syllable-like cues) is learned — but then discarded as global semantic regularities dominate optimization. In small models, these fragile local anchors are overwritten long before convergence: good habits vanish in service of minimizing perplexity on broader distributions. In large models, capacity prevents loss — but the anchor is retained largely through memorization rather than compositional integration.
+
+**Why it exists.** The autoregressive training loss rewards broad, averaged semantic fitness more than preserving small-scale predictive fidelity. Optimization drives the network toward fluency and coherence at scale, even if it means undermining the fragile local structures that would otherwise scaffold stronger semantics.
+
+**Consequences.**  Small models: look fluent but sloppy; local predictive sharpness deteriorates, producing typos, unstable sequences, or loss of crisp form. Large models: rapidly integrate and then connect examples; local consistency is preserved but also immediately contributes to memorization. 
+
+**Reinforcement.** Failure 1 (tokenization) forces subwords to be emergent, making local cues expendable. Failure 3 (no multi-scale) prevents the integration of local → higher structures, so small anchors are either dropped or rote-memorized. Failure 5 (equal-importance pressure) ensures that global signals dominate loss reduction, washing out fragile short-range skills.
+
+**intuition.** muscle memory of a snail vs an elephant
+
+
 ## 3. How the failures entangle
 
 * **F1 → F3/F4.** Fixed atoms force emergent hierarchy; practical partitions become geometric.
