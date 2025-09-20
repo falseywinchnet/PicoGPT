@@ -1,4 +1,4 @@
-# On the Structural Limits of Attention: Eight Failure Modes and a Phase-Transport Multiscale Alternative
+# On the Structural Limits of Language Modeling Systems: Eight Failure Modes and a Phase-Transport Multiscale Option
 
 ## Abstract
 
