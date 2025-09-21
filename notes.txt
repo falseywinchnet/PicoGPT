@@ -1,0 +1,3 @@
+9.21.25:
+we condition planning themes concerning future by training an auxillary decoding stack that works to discipline the predictors of theme.
+the autoregressive predictor learns to predict the next character, the lensing filters learn to identify the theme.
