@@ -1,4 +1,4 @@
-#copyright joshuah.rainstar@gmail.com 2025
+#copyright joshuah.rainstar@gmail.com
 from __future__ import annotations
 import math
 import typing
@@ -285,115 +285,116 @@ class SemanticClusterFeaturesCausal(nn.Module):
         return state.step(x_t)  # (B,K,C)
 
 
-
-# ---------------------------
-# Small utilities
-# ---------------------------
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-
-class GRUContextNav(nn.Module):
-    def __init__(self, C: int, K: int, dropout: float = 0.0):
-        super().__init__()
-        self.C, self.K = C, K
-        self.W_h = nn.Linear(C, C)
-        self.W_r = nn.Linear(C, C)           # computed once (kept as in your spec)
-        self.W_z = nn.Linear(C, C)
-        self.U_h = nn.ModuleList([nn.Linear(C, C, bias=False) for _ in range(K)])
-        self.W_init = nn.Linear(C, C)
-        self.U_Z = nn.Linear(C, C, bias=False)
-        self.drop = nn.Dropout(dropout)
-        self.out_ln = nn.LayerNorm(C)
-
-    def _ensure_seq(self, base, feats):
-        """
-        Accept:
-          base  : (B,C) or (B,T,C)
-          feats : (B,K,C) or (B,T,K,C)
-        Normalize to:
-          base  -> (B,T,C)
-          feats -> (B,T,K,C)  (broadcast T if missing)
-        """
-        squeeze_time = False
-        if base.dim() == 2:                    # (B,C) -> (B,1,C)
-            base = base[:, None, :]
-            squeeze_time = True
-        elif base.dim() != 3:
-            raise ValueError("base must be (B,C) or (B,T,C)")
-
-        if feats.dim() == 3:                   # (B,K,C) -> (B,1,K,C), will broadcast over T
-            feats = feats[:, None, :, :]
-        elif feats.dim() != 4:
-            raise ValueError("feats must be (B,K,C) or (B,T,K,C)")
-
-        return base, feats, squeeze_time
-
-    def forward(self, base: torch.Tensor, feats: torch.Tensor) -> torch.Tensor:
-        base, feats, squeeze_time = self._ensure_seq(base, feats)  # (B,T,C), (B,T,K,C)
-        B, T, K, C = feats.size()
-        assert K == self.K and C == self.C
-
-        ground   = self.W_h(base)        # (B,T,C)
-        criteria = self.W_r(base)        # (B,T,C)  (kept for parity with your sketch)
-        state    = self.W_z(base)        # (B,T,C)
-
-        # h_hat stack
-        hhat_sum = torch.zeros_like(base)
-        for i in range(K):
-            ui = self.U_h[i](feats[:, :, i, :])       # (B,T,C)
-            hhat_i = torch.tanh(ground + ui)          # (B,T,C)
-            hhat_sum = hhat_sum + hhat_i
-
-        initial = self.W_init(self.drop(hhat_sum))    # (B,T,C)
-
-        # reset gate — FIX 1: no extra dimension
-        reset = torch.sigmoid(state + initial)        # (B,T,C)
-
-        # h_final with reset — FIX 2: multiply in (B,T,C) space
-        h_final = torch.zeros_like(base)
-        for i in range(K):
-            ui = self.U_h[i](reset * feats[:, :, i, :])   # (B,T,C)
-            h_final = h_final + torch.tanh(ground + ui)   # (B,T,C)
-
-        update = torch.sigmoid(state + self.U_Z(initial)) # (B,T,C)
-        result = (1.0 - update) * base + update * h_final
-        result = self.out_ln(result)
-
-        if squeeze_time:
-            result = result[:, 0, :]
-        return result
-
-    @torch.no_grad()
-    def step(self, base_t: torch.Tensor, feats_t: torch.Tensor) -> torch.Tensor:
-        # base_t: (B,C), feats_t: (B,K,C)
-        return self.forward(base_t, feats_t)
-
 class GPTSemanticBlock(nn.Module):
     def __init__(self, config: GPTConfig):
         super().__init__()
         C = config.n_embd
         self.C = C
         self.K = config.n_scales
-        self.L = 1 + self.K                    # [K features | base]
+        # L = number of feature groups concatenated: token (1) + K scales
+        self.L = 1 + self.K
         self.features = SemanticClusterFeaturesCausal(num_scales=self.K, tau=1e-6)
         self.drop = nn.Dropout(config.dropout)
         self.ln = nn.LayerNorm(self.C)
-        self.nav = GRUContextNav(C=C, K=self.K, dropout=config.dropout)
-    
+        self.mlp = nn.Sequential(
+            nn.Linear(self.L * self.C, self.C * 3),
+            nn.GELU(),
+            nn.Linear(self.C * 3, self.C),
+        )
+
+        # NOTE: remove trailing comma so this is a ModuleList, not a tuple
+        # Each bottleneck maps C -> small_hidden -> C
+        self.bottlenecks = nn.ModuleList(
+            [nn.Sequential(nn.Linear(self.C, 8), nn.GELU(), nn.Linear(8, self.C)) for _ in range(self.K)]
+        )
+
     # vectorized
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x: (B,T,C)
-        feats = self.features(x)                      # (B,T,K,C)
-        return self.nav(x, feats)             # returns (B,T,C)
+        # x: (B, T, C)
+        B, T, C = x.shape
+        feats = self.features(x)               # (B, T, K, C)
+
+        # apply per-scale bottlenecks in parallel (vectorized)
+        if self.K > 0:
+            # feats_per_scale: list of (B, T, C) after bottleneck
+            # do this with a list comprehension to ensure modules are registered
+            processed = [self.bottlenecks[j](feats[:, :, j, :]) for j in range(self.K)]
+            # stack back to (B, T, K, C)
+            proc_feats = torch.stack(processed, dim=2)
+            # reshape to (B, T, K*C)
+            proc_feats_t = proc_feats.reshape(B, T, self.K * C)
+        else:
+            proc_feats_t = x.new_zeros(B, T, 0)
+
+        # concat token embedding with processed features
+        x_in = torch.cat((x, proc_feats_t), dim=-1)  # (B, T, (1+K)*C)
+        out = x + self.drop(self.ln(self.mlp(x_in)))
+        return out
 
     # single-step incremental
     @torch.no_grad()
     def step(self, x_t: torch.Tensor, feat_state: CausalPyramidState) -> torch.Tensor:
-        feats_t = self.features.step(x_t, feat_state)  # (B,K,C)
-        return self.nav.step(x_t, feats_t)           # (B,C)
+        # x_t: (B, C)
+        B, C = x_t.shape
+        feats_t = self.features.step(x_t, feat_state)  # (B, K, C)
 
+        if self.K > 0:
+            # apply each bottleneck to the corresponding (B, C) slice
+            processed = [self.bottlenecks[j](feats_t[:, j, :]) for j in range(self.K)]
+            proc_feats = torch.stack(processed, dim=1)    # (B, K, C)
+            proc_feats_t = proc_feats.reshape(B, self.K * C).clone().detach() #only propogate on future
+        else:
+            proc_feats_t = x_t.new_zeros(B, 0)
 
+        x_in = torch.cat((x_t, proc_feats_t), dim=-1)     # (B, (1+K)*C)
+        out = x_t + self.drop(self.ln(self.mlp(x_in)))
+        return out
+
+class GPTSemanticBlock_dead(nn.Module):
+    def __init__(self, config: GPTConfig,bottlenecks):
+        super().__init__()
+        C = config.n_embd
+        self.C = C
+        self.K = config.n_scales
+        # L = number of feature groups concatenated: token (1) + K scales
+        self.L = 1 + self.K
+        self.features = SemanticClusterFeaturesCausal(num_scales=self.K, tau=1e-6)
+        self.drop = nn.Dropout(config.dropout)
+        self.ln = nn.LayerNorm(self.C)
+        self.mlp = nn.Sequential(
+            nn.Linear(self.K * self.C, self.C * 3),
+            nn.GELU(),
+            nn.Linear(self.C * 3, self.C),
+        )
+
+        # NOTE: remove trailing comma so this is a ModuleList, not a tuple
+        # Each bottleneck maps C -> small_hidden -> C
+        self.bottlenecks = bottlenecks
+
+    # vectorized
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: (B, T, C)
+        B, T, C = x.shape
+        feats = self.features(x)               # (B, T, K, C)
+
+        # apply per-scale bottlenecks in parallel (vectorized)
+        if self.K > 0:
+            # feats_per_scale: list of (B, T, C) after bottleneck
+            # do this with a list comprehension to ensure modules are registered
+            processed = [self.bottlenecks[j](feats[:, :, j, :]) for j in range(self.K)]
+            # stack back to (B, T, K, C)
+            proc_feats = torch.stack(processed, dim=2)
+            # reshape to (B, T, K*C)
+            proc_feats_t = proc_feats.reshape(B, T, self.K * C)
+        else:
+            proc_feats_t = x.new_zeros(B, T, 0)
+
+        # concat token embedding with processed features
+        x_in = proc_feats_t
+        out = self.drop(self.ln(self.mlp(x_in)))
+        return out
+
+        
 class FixedEmbedding(nn.Module):
     def __init__(self, config, seed=0):
         super().__init__()
@@ -419,6 +420,8 @@ class GPTConfig:
     n_scales:int = 9
     dropout: float = 0.1
 
+
+
 class GPT(nn.Module):
     def __init__(self, config):
         super().__init__()
@@ -426,12 +429,15 @@ class GPT(nn.Module):
         assert config.block_size is not None
         self.config = config
         self.n_embd = config.n_embd
+        self.drop = nn.Dropout(0.6)
 
         self.transformer = nn.ModuleDict(dict(
             wte = FixedEmbedding(config),
             h = nn.ModuleList([GPTSemanticBlock(config) for _ in range(config.n_layer)]),
+
         ))
-       
+        self.a = nn.ModuleList([GPTSemanticBlock_dead(config, self.transformer.h[i].bottlenecks) for i in range(config.n_layer)])
+
         self.lm_head = nn.Linear(self.config.n_embd, self.config.vocab_size, bias=False)
 
 
@@ -442,10 +448,21 @@ class GPT(nn.Module):
         x = self.transformer.wte(idx) 
         x = x.detach()                 # sever any stale history just in case
         x.requires_grad_(True)         # make x a grad leaf for τ at layer 0
-
+        shifted = torch.zeros_like(x)
+        if t > 1:
+        # shifted[:, 0:T-1, :] = x[:, 1:T, :]
+            shifted[:, :-1, :] = x[:, 1:, :].contiguous()
+        # last position remains zero (no future tokens)
+        reversed_input = torch.flip(shifted, dims=(1,))
+        
         for block in self.transformer.h:
                 x= block(x)
+        for block in self.a:
+                reversed_input= block(reversed_input)
+
+        reversed_tensor = torch.flip(reversed_input, dims=(1,)) 
         
+        x= x + reversed_tensor#leak learned guessing about before
         if targets is not None:
             logits = self.lm_head(x)
             loss = F.cross_entropy(
