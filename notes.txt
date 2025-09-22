@@ -1,3 +1,16 @@
 9.21.25:
 we condition planning themes concerning future by training an auxillary decoding stack that works to discipline the predictors of theme.
 the autoregressive predictor learns to predict the next character, the lensing filters learn to identify the theme.
+
+
+on learning to learn:
+im currently thinking about an idea for COT/RL/acquisition training.
+it works like this: 
+two instances of model are initialized as student, teacher.
+Teacher has access to databases, web, books, etc.
+Teacher notes that teacher does not know about X.
+This initially is almost everything.
+teacher prompts student about x.
+teacher flags correct responses using information teacher has access to.
+response-query pairs are saved for training.
+
