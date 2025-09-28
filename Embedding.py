@@ -517,4 +517,12 @@ class TimeEmbedding(nn.Module):
 #so, embeddings at every point MUST contain the entire semantic flow- or they contain none of it.
 
 
+HOW TO USE THIS METHOD:
+#drop this in over NN.embedding.
+#set config.init_embed = your true embedding. set config.n_embed 
+#(n_scales + 1) * init_embed//2, or slice at end of model.
+#recommend n_scales +1 = n_heads if using attention, and a fat block size.
+#however, if using streaming flow, possibly try higher n_scales- OR
+#use learned fir coeffs,wavelet accumulators to take rolling update summary on each scale,
+#and model learns semantic units and memory that way.
 #use reset_feats between starting prompts and train/eval starting.
