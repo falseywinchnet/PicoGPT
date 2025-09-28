@@ -1,3 +1,4 @@
+#copyright joshuah.rainstar@gmail.com MIT
 from __future__ import annotations
 import math
 import typing
@@ -8,182 +9,325 @@ import torch.nn.functional as F
 from dataclasses import dataclass
 from typing import Dict, Tuple
 
-def _is_prime(n: int) -> bool:
-    if n < 2: return False
-    if n % 2 == 0: return n == 2
-    r = int(n**0.5)
-    for f in range(3, r+1, 2):
-        if n % f == 0: return False
-    return True
 
-def _factorize(n: int):
-    f, cnt = [], {}
-    d = 2
-    while d * d <= n:
-        while n % d == 0:
-            cnt[d] = cnt.get(d, 0) + 1
-            n //= d
-        d += 1 if d == 2 else 2
-    if n > 1: cnt[n] = cnt.get(n, 0) + 1
-    return list(cnt.keys())
+def _norm(v, eps: float = 1e-12):
+    return torch.linalg.vector_norm(v, dim=-1, keepdim=True).clamp_min(eps)
 
-def _primitive_root(p: int) -> int:
-    # p must be prime
-    phi = p - 1
-    factors = _factorize(phi)
-    for g in range(2, p):
-        ok = True
-        for q in factors:
-            if pow(g, phi // q, p) == 1:
-                ok = False
-                break
-        if ok:
-            return g
-    raise RuntimeError("no primitive root found")
 
-def _welch_costas_perm(V: int, device=None):
+def _unit(v, eps: float = 1e-12):
+    return v / _norm(v, eps)
+
+    
+@torch.no_grad()
+def phase_transport_between(
+    curr: torch.Tensor,
+    prev: torch.Tensor,
+    tau: float = 1e-6,          # semantic threshold (unchanged)
+    eps: float = 1e-12          # numeric epsilon (NEW: decoupled from tau)
+) -> torch.Tensor:
+    assert curr.shape == prev.shape and curr.dim() == 3
+    B, T, C = curr.shape
+
+    # Units (reuse norms) — clamp with eps (NOT tau)
+    nu = torch.linalg.vector_norm(curr, dim=-1, keepdim=True).clamp_min(eps)   # (B,T,1)
+    nv = torch.linalg.vector_norm(prev, dim=-1, keepdim=True).clamp_min(eps)   # (B,T,1)
+    u = curr / nu
+    v = prev / nv
+
+    w = curr - prev
+    c = (u * v).sum(dim=-1, keepdim=True)                                      # (B,T,1)
+
+    # Masks (semantic thresholds use tau)
+    near_pos = (c >  1.0 - tau)                                                # (B,T,1)
+    near_neg = (c < -1.0 + tau)                                                # (B,T,1)
+    small_u  = (nu < tau)                                                      # (B,T,1)
+    small_v  = (nv < tau)                                                      # (B,T,1)
+    trivial  = near_pos | small_u | small_v                                    # (B,T,1)
+
+    # General branch
+    denom = (1.0 + c).clamp_min(eps)                                           # (B,T,1)
+    a = (v * w).sum(dim=-1, keepdim=True)                                      # (B,T,1)
+    b = (u * w).sum(dim=-1, keepdim=True)                                      # (B,T,1)
+    Kw  = u * a - v * b                                                        # (B,T,C)
+    K2w = u * (a * c - b) + v * (b * c - a)                                    # (B,T,C)
+    y_gen = w - Kw + (K2w / denom)                                             # (B,T,C)
+
+    # Antipodal candidate
+    if C == 1:
+        y_neg = -w
+    else:
+        # Keep this normalization stable with eps as well
+        idx = torch.argmin(v.abs().reshape(-1, C), dim=1, keepdim=True)        # (B*T,1)
+        s = v.reshape(-1, C).gather(1, idx)                                    # (B*T,1)
+        p = -s * v.reshape(-1, C)
+        onehot = F.one_hot(idx.squeeze(-1), num_classes=C).to(s.dtype)
+        p = p + onehot
+        n = torch.linalg.vector_norm(p, dim=1, keepdim=True).clamp_min(eps)
+        p = (p / n).view(B, T, C)
+        proj_v = (v * w).sum(dim=-1, keepdim=True) * v                         # (B,T,C)
+        proj_p = (p * w).sum(dim=-1, keepdim=True) * p                         # (B,T,C)
+        y_neg = w - 2.0 * proj_v - 2.0 * proj_p
+
+    # Fuse selections
+    y = torch.where(trivial, w, y_gen)
+    y = torch.where(near_neg, y_neg, y)
+    return y
+
+# ===========================================================
+# Multi-scale features (vectorized pyramid)
+# ===========================================================
+class CausalCentroidPyramid(nn.Module):
     """
-    Welch Costas permutation σ on {0..V-1}, where V = p-1 for prime p.
-    σ[i] = g^(i+1) mod p, mapped to 0..V-1 by subtracting 1.
+    Child-driven centroid pyramid.
+    Level s (s=0..K-1) covers window 2^(s+1):
+      - child stream z_0 := x
+      - y_s(t) = PT(z_s(t), z_s(t - 2^s))             # distance between bracketing child markers
+      - z_{s+1}(t) = z_s(t) - 0.5 * y_s(t)            # centerpoint of the window (right-anchored)
+    Unsupported prefix t < 2^s is zeroed.
+    Returns feats: (B,T,K,C) with feats[:,:,s,:] = y_s.
     """
-    p = V + 1
-    if not _is_prime(p):
-        return None
-    g = _primitive_root(p)
-    sigma = torch.empty(V, dtype=torch.long, device=device)
-    for i in range(V):
-        sigma[i] = pow(g, i + 1, p) - 1
-    return sigma  # permutation of 0..V-1
+    def __init__(self, num_scales: int, tau: float = 1e-6):
+        super().__init__()
+        assert num_scales >= 1
+        self.K = num_scales
+        self.tau = float(tau)
 
-def _coprime_mul_perm(V: int, device=None):
-    """
-    Fallback: σ[i] = (a*i + b) % V with gcd(a, V)=1 and a not ≡ ±1 mod V.
-    Not Costas, but non-monotone and well-distributed.
-    """
-    # pick a
-    a = None
-    for cand in range(2, V):
-        if math.gcd(cand, V) == 1 and cand % V not in (1, V-1):
-            a = cand
-            break
-    if a is None:
-        a = 1  # degenerate small V
-    b = V // 3
-    i = torch.arange(V, device=device)
-    return ((a * i + b) % V).long()
+    @torch.no_grad()
+    def forward(
+        self,
+        x: torch.Tensor,
+        mask_early: bool = True,
+        return_children: bool = False
+    ) -> typing.Union[torch.Tensor, Tuple[torch.Tensor, typing.List[torch.Tensor]]]:
+        assert x.dim() == 3
+        B, T, C = x.shape
 
-def _perm_inverse(sigma: torch.Tensor) -> torch.Tensor:
-    inv = torch.empty_like(sigma)
-    inv[sigma] = torch.arange(sigma.numel(), device=sigma.device)
-    return inv
+        feats = []
+        z = x.clone()
+        z_hist = [] if return_children else None
+
+        for s in range(self.K):
+            d = 1 << s
+
+            left = torch.zeros_like(z)
+            if T > d:
+                left[:, d:, :] = z[:, :-d, :].contiguous()
+
+            y = phase_transport_between(z, left, tau=self.tau)  # (B,T,C)
+            if mask_early:
+                y[:, :d, :].zero_()
+
+            feats.append(y)
+            if return_children:
+                # Store the child stream used to compute y_s at each t
+                z_hist.append(z)
+
+            z = z - 0.5 * y
+            if mask_early:
+                z[:, :d, :].zero_()
+
+        feats = torch.stack(feats, dim=2)  # (B,T,K,C)
+        if return_children:
+            return feats, z_hist
+        return feats
+
+
+        # ----- STREAMING STATE FOR INFERENCE -----
+class CausalPyramidState:
+    """
+    Keeps ring buffers of child marker streams z_s for s=0..K-1 with lengths 2^s.
+    At step t:
+      - z_0(t) = x_t
+      - for s: y_s(t) = PT(z_s(t), z_s(t - 2^s)); z_{s+1}(t) = z_s(t) - 0.5*y_s(t)
+    """
+    def __init__(self, num_scales: int, C: int, device, batch_size: int = 1, tau: float = 1e-6):
+        self.K = num_scales
+        self.C = C
+        self.B = batch_size
+        self.device = device
+        self.tau = float(tau)
+        self.t = 0
+
+        # ring buffers for child streams z_s
+        self.buffers = [torch.zeros(batch_size, (1 << s), C, device=device) for s in range(self.K)]
+        self.ptrs = [0 for _ in range(self.K)]
+
+    def _read(self, level: int, r: int):
+        if self.t < r:
+            return torch.zeros(self.B, self.C, device=self.device)
+        L = self.buffers[level].size(1)
+        idx = (self.ptrs[level] - r) % L
+        return self.buffers[level][:, idx, :]
+
+    def _push(self, level: int, value: torch.Tensor):
+        L = self.buffers[level].size(1)
+        self.buffers[level][:, self.ptrs[level], :] = value
+        self.ptrs[level] = (self.ptrs[level] + 1) % L
+        
+    def reset(self):
+        for s in range(self.K):
+            self.buffers[s].zero_()
+            self.ptrs[s] = 0
+        self.t = 0
+
+    @torch.no_grad()
+    def step(self, x_t: torch.Tensor) -> torch.Tensor:
+        B, C = x_t.shape
+        assert B == self.B and C == self.C
+
+        feats = []
+        z_t = x_t.clone()  # z_0(t)
+
+        for s in range(self.K):
+            d = 1 << s
+            left = self._read(level=s, r=d)           # z_s(t-d)
+            y_t = phase_transport_between(z_t[:, None, :], left[:, None, :], tau=self.tau).squeeze(1)
+            if self.t < d:
+                y_t.zero_()
+            feats.append(y_t)
+
+            # push current child stream for this level
+            self._push(level=s, value=z_t)
+
+            # next level child marker z_{s+1}(t)
+            z_t = z_t - 0.5 * y_t
+            if self.t < d:
+                z_t.zero_()
+
+        self.t += 1
+        return torch.stack(feats, dim=1)  # (B,K,C)
+    @torch.no_grad()
+    def bulk_write_from_block(self, z_histories: typing.List[torch.Tensor], T_block: int):
+        """
+        z_histories[s]: (B, T_block, C) for z_s(t) over the block.
+        Writes the last min(T_block, 2^s) child values into level-s ring buffer,
+        sets ptr so that future _read() is correct.
+        """
+        old_t = self.t
+        new_t = old_t + T_block
+
+        for s, z_s in enumerate(z_histories):
+            L = self.buffers[s].size(1)         # 2^s
+            n = min(T_block, L)
+            last = z_s[:, -n:, :]               # (B, n, C)
+
+            # For times i in [new_t - n, new_t - 1], indices are i % L
+            perm = torch.remainder(torch.arange(new_t - n, new_t, device=self.device), L)  # (n,)
+            # Assign across batch without loops
+            self.buffers[s][:, perm, :] = last
+
+            # ptr should point to "next write" position (i.e., new_t % L)
+            self.ptrs[s] = new_t % L
+
+        self.t = new_t
+
+
+class SemanticClusterFeaturesCausal(nn.Module):
+    """
+    Unified wrapper:
+      - forward(x): vectorized for training
+      - step(x_t, state): single-step for inference with cache
+    """
+    def __init__(self, num_scales: int, tau: float = 1e-6):
+        super().__init__()
+        self.pyramid = CausalCentroidPyramid(num_scales=num_scales, tau=tau)
+        self.K = num_scales
+        self.tau = float(tau)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.pyramid(x)  # (B,T,K,C)
+
+    @torch.no_grad()
+    def step(self, x_t: torch.Tensor, state: CausalPyramidState) -> torch.Tensor:
+        return state.step(x_t)  # (B,K,C)
+
+
 
 class FlatRollEmbed(nn.Module):
     """
-    Replacement for nn.Embedding that maps token id i -> cyclic roll^i of a base
-    length-V vector whose non-DC spectrum is flat (DC=0). Requires V == n_embd.
-    Weights are frozen by default.
-    this yields an optimal embedding that is considered perfect.
-    The 'eye' is mixed at 0.5 and then rows are permuted by a Costas-like order
-    to maximize uniqueness while keeping even collapse.
-    but wait, you're asking, my embeds/vocab is not orthagonal!
-    the solution is simple, clever, efficient- 
-    use  Smooth full-space rotation matrix via Lie algebra exponential map.
-        A = exp(t·G), where G ∈ so(D) is skew-symmetric and full-rank.
-    partition vocab idx space by modulo over chosen block size, use different rotation
-    range from 0 to pi(evenly divided) for all partitions, use ONE embed matrix,
-    embed->shift. Minimizes necessary parameter count. up-project to desired embed dim.
-    for decoder, you're operating over a larger dimensional space as-is. that's fine.
-    if you like, you can try down-project and repeat-decode invert on all blocks,
-    and use stiefel inverting by transpose but use two sets of slices of rotation ranges
-    so that you have blue noise coverage with a partition going from original bound to bound
-    but also overlap going from mid to mid, try decode on all, hard route to one,
-    take logits from that one- > bam, no learned decode either.
-    down-projection tied to up-projection and you have a learned high efficiency mapping.
-    
+    Embedding matrix W in R^{V x D} built as:
+      W = roll_rows(x) + S
+    where x ∈ R^D has |FFT(x)|^2 flat (k=1..D-1) and DC=0, roll_rows(x)[r] = roll(x, r % D),
+    and S adds a single spike per row at column (r + M) % D, with M = argmax(x) and scale N = 1/(x[M]+eps).
+
+    Works for any vocab_size V and embedding dim D.
     """
+
     def __init__(self, config, scale: str = "box", seed: int = 0,
                  freeze: bool = True, dtype=None, device=None):
         super().__init__()
-        assert config.n_embd == config.vocab_size, (
-            f"Expected n_embd == vocab_size, got {config.n_embd} != {config.vocab_size}"
-        )
         V = int(config.vocab_size)
+        D = int(config.n_embd)
         dtype = dtype or torch.float32
+        eps = 1e-12
 
-        eye = torch.eye(V, dtype=dtype, device=device)
-        weight = self._make_weight(V, scale=scale, seed=seed,
-                                   dtype=dtype, device=device)  # [V, V]
-        M = int(torch.argmax(weight[0]))        # index of max in base x (row 0)
-        pm = weight[0, M]                       # scalar
-        N = 1.0 / pm
-        
-        eye = torch.roll(eye, shifts=M, dims=1) # shift spike position within each row
-        eye = eye * N
-        mixed =  weight + eye  # add identity towers
+        # base vector x ∈ R^D with flat spectrum, DC=0
+        x = self._make_base(D, scale=scale, seed=seed, dtype=dtype, device=device)  # [D]
 
-        # --- compute a strong-scramble row order (Costas if possible) ---
-        sigma = _welch_costas_perm(V, device=device)
-        if sigma is None:
-            sigma = _coprime_mul_perm(V, device=device)
-        # We want ones at (row = σ[i], col = i). For row-permutation via index_select,
-        # use r_idx = σ^{-1} so that new_row j pulls old_row r_idx[j] with 1 at column j=σ[i].
-        r_idx = _perm_inverse(sigma)
+        # circulant-like rows: row r is x rolled by (r % D)
+        # (vectorized loop for clarity; can be optimized further if needed)
+        shifts = torch.arange(V, device=device)
+        rows = [torch.roll(x, shifts=int(s.item() % D), dims=0) for s in shifts]
+        W = torch.stack(rows, dim=0).to(dtype)
 
-        # keep for reference / decoding
-        self.register_buffer("row_perm", r_idx, persistent=False)
-        self.register_buffer("sigma", sigma, persistent=False)
+        # align a single positive extremum via a "tower" S
+        M = int(torch.argmax(x))          # index of max in x
+        pm = x[M].item()
+        N = 1.0 / (pm + eps)              # safe reciprocal
 
-        mixed = mixed.index_select(0, r_idx)
+        # S[r, (r + M) % D] = N
+        r_idx = torch.arange(V, device=device)
+        c_idx = (r_idx + M) % D
+        S = torch.zeros((V, D), dtype=dtype, device=device)
+        S[r_idx, c_idx] = N
+
+        mixed = W + S
         self.embed = nn.Embedding.from_pretrained(mixed, freeze=freeze)
 
-
     @staticmethod
-    def _row_perm_max_equidistant(V: int, device=None) -> torch.Tensor:
+    def _make_base(D: int, scale: str = "box", seed: int = 0,
+                   dtype=torch.float32, device=None) -> torch.Tensor:
         """
-        Row permutation that evenly offsets the identity's '1' away from the diagonal.
-        Uses a single cyclic shift by k = floor(V/2).
-        """
-        if V <= 1:
-            return torch.arange(V, device=device, dtype=torch.long)
-        k = V // 2
-        if k == 0:  # only happens when V == 1, handled above; keep for safety
-            k = 1
-        return ((torch.arange(V, device=device) + k) % V).long()
+        Build x ∈ R^D where |FFT(x)| is flat for k=1..D-1 and DC=0.
 
-    @staticmethod
-    def _make_weight(V: int, scale: str = "box", seed: int = 0,
-                     dtype=torch.float32, device=None) -> torch.Tensor:
-        """
-        Returns a (V, V) tensor whose rows are cyclic rolls of a base vector x in R^V
-        with |FFT(x)|^2 flat for k=1..V-1 and DC=0.
         scale:
           - "unit": ||x||_2 = 1
           - "box":  max|x_i| = 1
         """
-        # build on CPU, move at end
-        complex_dtype = torch.complex64 if dtype == torch.float32 else torch.complex128
-        g = torch.Generator().manual_seed(seed)
+        # Build on CPU, then move to device at the end.
+        # Use complex64 for float/bfloat/half; complex128 otherwise.
+        if dtype in (torch.float16, torch.bfloat16, torch.float32):
+            complex_dtype = torch.complex64
+            work_float = torch.float32
+        else:
+            complex_dtype = torch.complex128
+            work_float = torch.float64
 
-        X = torch.zeros(V, dtype=complex_dtype)
-        # DC bin
+        X = torch.zeros(D, dtype=complex_dtype)
+
+        # DC bin = 0
         X[0] = torch.tensor(0, dtype=complex_dtype)
 
-        if V % 2 == 0:
-            # bins 1..V/2-1 are complex-conjugate pairs; Nyquist bin must be real
-            for k in range(1, V // 2):
-                phi = torch.rand((), generator=g) * (2 * math.pi)
-                val = torch.cos(phi) + 1j * torch.sin(phi)
+        if D % 2 == 0:
+            # bins 1..D/2-1 are complex-conjugate pairs; Nyquist bin must be real
+            for k in range(1, D // 2):
+                phi = torch.rand((), dtype=work_float) * (2 * math.pi)
+                val = torch.cos(phi).to(work_float) + 1j * torch.sin(phi).to(work_float)
+                val = val.to(complex_dtype)
                 X[k] = val
-                X[V - k] = torch.conj(val)
-            X[V // 2] = 1.0 if torch.rand((), generator=g) < 0.5 else -1.0
+                X[D - k] = torch.conj(val)
+            # Nyquist bin (real, ±1)
+            X[D // 2] = (1.0 if torch.rand(()) < 0.5 else -1.0)
         else:
-            for k in range(1, (V - 1) // 2 + 1):
-                phi = torch.rand((), generator=g) * (2 * math.pi)
-                val = torch.cos(phi) + 1j * torch.sin(phi)
+            for k in range(1, (D - 1) // 2 + 1):
+                phi = torch.rand((), dtype=work_float) * (2 * math.pi)
+                val = torch.cos(phi).to(work_float) + 1j * torch.sin(phi).to(work_float)
+                val = val.to(complex_dtype)
                 X[k] = val
-                X[V - k] = torch.conj(val)
+                X[D - k] = torch.conj(val)
 
-        x = torch.fft.ifft(X).real  # real length-V base vector
+        x = torch.fft.ifft(X).real  # real length-D base vector (float32/64)
+        x = x.to(work_float)
 
         if scale == "unit":
             x = x / (x.norm() + 1e-12)
@@ -192,12 +336,185 @@ class FlatRollEmbed(nn.Module):
         else:
             raise ValueError("scale must be 'unit' or 'box'")
 
-        rows = [torch.roll(x, shifts=r, dims=0) for r in range(V)]
-        W = torch.stack(rows, dim=0).to(dtype=dtype)
+        x = x.to(dtype)
         if device is not None:
-            W = W.to(device)
-        return W
+            x = x.to(device)
+        return x
 
     def forward(self, input_ids: torch.LongTensor):
-        # (batch, seq_len, V)
+        # (batch, seq_len, D)
         return self.embed(input_ids)
+
+class RandomOrthoprojector(nn.Module):
+    """
+    Maps R^d -> R^(d//2) via a fixed random orthoprojector (JL-style).
+    Preserves Euclidean structure approximately; scales to preserve expected norm.
+    Expects config.n_embd (int). Forward accepts (b, c) or (b, t, c).
+    """
+    def __init__(self, config):
+        super().__init__()
+        d = int(config.n_embd)
+        d2 = d // 2
+
+        # Random orthogonal matrix via QR; take first d//2 rows => orthonormal rows
+        G = torch.randn(d, d)
+        Q, _ = torch.linalg.qr(G)        # Q: (d, d), orthogonal
+        R = Q[:d2, :]                    # (d2, d), rows orthonormal
+
+        # Scale so that E[||Rx||^2] ≈ ||x||^2
+        R = R * math.sqrt(d / d2)
+
+        # Store transpose for right-multiplication on (..., d)
+        self.register_buffer("proj_T", R.t())  # (d, d2), no grad
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        P = self.proj_T.to(dtype=x.dtype, device=x.device)
+        # Supports (b, c) or (b, t, c); matmul broadcasts on the trailing dim
+        return x @ P
+        
+class FeatureDistiller(nn.Module):
+    """
+    Uses a single RandomOrthoprojector to downproject:
+      - x: (..., C) -> (..., D)
+      - feats: (..., K, C) -> (..., K, D)
+    Same weights; fully parallel/broadcasted matmul.
+    """
+    def __init__(self, config):
+        super().__init__()
+        self.proj = RandomOrthoprojector(config)  # C -> D = C//2
+
+    def forward(
+        self,
+        x: torch.Tensor,         # (..., C)
+        feats: torch.Tensor      # (..., K, C)
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        P = self.proj.proj_T.to(dtype=x.dtype, device=x.device)  # (C, D)
+        x_down = x @ P                                           # (..., D)
+        feats_down = feats @ P                                   # (..., feats.K, D)
+        return x_down, feats_down
+
+class TimeEmbedding(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        assert config.vocab_size is not None
+        assert config.init_embed is not None
+        assert config.init_embed >= config.vocab_size
+        assert config.block_size is not None
+        assert config.n_scales is not None
+        
+
+        self.config = config
+
+        self.C = int(config.init_embed)
+        self.K = int(config.n_scales)
+        self.D = self.C // 2
+        self.width = (self.K + 1) * self.D    #x,each feature, efficiently and correctly reduced
+        
+        # concat of x_down (D) + K*D
+        assert config.n_embd == width #final embeddings must equal the width returned
+
+        # Modules
+        self.wte = FlatRollEmbed(config)
+        self.features = SemanticClusterFeaturesCausal(num_scales=self.K, tau=1e-6)
+        self.distiller = FeatureDistiller(config)
+
+        # Streaming state (batch_size must be consistent for step() usage)
+        device = next(self.parameters()).device
+        B = int(getattr(config, "batch_size", 1))
+        self.feat_states = CausalPyramidState(
+            num_scales=self.K,
+            C=self.C,
+            device=device,
+            batch_size=B,
+            tau=1e-6
+        )
+
+    def _fuse_block(self, x: torch.Tensor, feats: torch.Tensor) -> torch.Tensor:
+        """
+        x:     (B, T, C)
+        feats: (B, T, K, C)
+        -> (B, T, (K+1)*D)
+        """
+        x_down, feats_down = self.distiller(x, feats)         # (B,T,D), (B,T,K,D)
+        B, T, _, = x.shape
+        fused = torch.cat([x_down, feats_down.reshape(B, T, -1)], dim=-1)
+        return fused
+
+    def _fuse_step(self, x_t: torch.Tensor, feats_t: torch.Tensor) -> torch.Tensor:
+        """
+        x_t:     (B, C)
+        feats_t: (B, K, C)
+        -> (B, (K+1)*D)
+        """
+        x_down, feats_down = self.distiller(x_t, feats_t)     # (B,D), (B,K,D)
+        fused = torch.cat([x_down, feats_down.reshape(x_t.size(0), -1)], dim=-1)
+        return fused
+        
+    def reset_feats(self):
+        self.feat_states.reset()
+
+    def forward(self, idx: torch.LongTensor) -> torch.Tensor:
+        """
+        Rules:
+          - If idx is (B, T) [block]:
+              * training mode: vectorized feats; DO NOT update streaming state
+              * eval mode:     vectorized feats; bulk-update streaming state
+          - If idx is (B,)    [single-step]:
+              * always treat as online: use state.step(...) and update state
+        """
+        device = next(self.parameters()).device
+
+        if idx.ndim == 2:
+            # BLOCK PATH: (B, T)
+            B, T = idx.shape
+            x = self.wte(idx.to(device))                         # (B, T, C)
+
+            if self.training:
+                # Training: compute feats; don't populate state
+                feats = self.features(x)                         # (B, T, K, C)
+                return self._fuse_block(x, feats)                # (B, T, (K+1)*D)
+           else:
+                B, T = idx.shape
+                outs = []
+                for t in range(T):
+                    x_t = self.wte(idx[:, t].to(device))                 # (B, C)
+                    feats_t = self.features.step(x_t, self.feat_states)  # (B, K, C)  <-- uses cache
+                    outs.append(self._fuse_step(x_t, feats_t))           # (B, (K+1)*D)
+                return torch.stack(outs, dim=1)                          # (B, T, (K+1)*D)
+
+        elif idx.ndim == 1:
+            # SINGLE-STEP PATH: (B,)
+            B = idx.shape[0]
+            x_t = self.wte(idx.to(device))                       # (B, C)
+            feats_t = self.features.step(x_t, self.feat_states)  # (B, K, C)
+            return self._fuse_step(x_t, feats_t)                 # (B, (K+1)*D)
+
+        else:
+            raise ValueError("idx must be 1D (B,) or 2D (B,T)")
+
+#goals:
+#you should be feeding 1 at a time and learning online.
+#if your model cannot learn online then it is a garbage design.
+#my recommendation- supplement embeddings with planning information.
+#that means initialize another embedding instance and reverse the sequence of idx,
+#then reverse it again, then roll it forward by one, then drop off the bottom x chunk,
+#then train aux loss against this forward knowledge on an RNN at each level that is fed past and current step product,
+#then integrate rnn product as aux info into next step. try to not only predict next state,
+#but build something better and recursively plan states top to bottom and then bottom to top.
+#that way your convergence is on choosing the future from options by intelligent refinement.
+#for active working memory, current approaches are not the solution-
+#think about it. your model is planning and updating a trajectory through a learned latent universe.
+#it decides what to say the moment it says it, and cant recursively redirect itself on latent discovery.
+#it CAN and must redirect itself, thats not what im saying. im saying its a fragile system.
+#a better approach can and will be leaned memnonic recall using shorthand encoding.
+#model must learn to store a shorthand summary efficiently using a token to call out- forced storage-
+#and then must learn to periodically invoke it into state(self-grounding) and periodically update it.
+#of course this also means our token-sequential speed must go up so we can handle more tokens.
+#as far as memory, statefulness, statelessness, no model remembers the entire conversation, or even part of it.
+#model can only know present point in manifold, vectors pointing back, vectors? maybe pointing forward.
+#EVEN with attention, EVEN with RAG, EVEN with anything else, if model is autoregressively generated,
+#model only knows about this instant. it is properties of what is encoded IN this instant that contain all previous instants.
+#so, embeddings at every point MUST contain the entire semantic flow- or they contain none of it.
+
+
+#use reset_feats between starting prompts and train/eval starting.
