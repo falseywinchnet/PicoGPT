@@ -5,7 +5,10 @@ class Wolf(Optimizer):
   """Implements Wolf algorithm."""
   #Wolf, also called Rainstar Optimizer, is fast. it is resistant to valleys and some other things where adam hangs.
   #on some problems, it is faster than adam. on most things, proper annealing and adam is still a good idea.
-  #wolf is initially smoother than adam over difficult plateaus and at high LR.
+  #wolf is initially smoother than adam over difficult plateaus and at high LR, except on quadratic problems.
+  #for a proven guarantee on all problems set etcerta to  2/(lr*λ_max_hessian_eigenvalue).
+  #however, this is more easily said than done- economically anyway. 
+  #ongoing work to optimise this is in progress.
   def __init__(self, params, lr=2e-3, betas=(0.9, 0.999), eps=1e-8):
         # Define default parameters
         defaults = dict(lr=lr, betas=betas, eps=eps)
