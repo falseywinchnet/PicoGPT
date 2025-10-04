@@ -10,6 +10,9 @@ class ZGate(nn.Module):
         super().__init__()
     #original math preserved in forward_exact, forward is faster but some small rounding changes
     #20% better and 20% faster than GELU if implemented efficiently
+    #gotta be more responsible with your ln, lr, clipping, ie, theres more late-range spiking.
+    #what is this? basically its a softer relu, but it behaves like a relu. softplus doesnt.
+    #
     #joshuah.rainstar@gmail.com wrote this gate
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # Reuse intermediates; remove redundant ReLU; collapse z to 0.5*sp^2
