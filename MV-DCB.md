@@ -1,7 +1,5 @@
 # MV‑DCB (Multi‑Vector, Depth‑Coupled Backprop)
 
-## The intuition in one breath
-
 Traditional backprop sends error **through a single dot‑product channel** at each layer. That’s like trying to reposition a heavy table by pushing with **one finger** straight through the middle: you move, but you also skid, wobble, and waste effort.
 
 **MV‑DCB** treats everything as **coordinates** (inputs, activations, weights, logits) drawing off our thesis- see thesis.md- and moves them with a **small team of coordinated pushes**. At each layer it builds a tiny, data‑conditioned **span of directions** (2–4 vectors) that reflect the relevant local geometry **coupled to deeper layers**, projects the error into that span, and only then updates. You still use Adam/SGD exactly the same way; we only change *what gradient you feed them*.
@@ -96,5 +94,4 @@ You keep your model, your optimizer, your training loop. You gain:
 * **More respectful handling of rare signals**,
 * **Minimal engineering lift** and low runtime overhead.
 
-That combination—**safer first steps + steadier geometry‑aware pushes**—is why this feels like a practical, incremental upgrade to standard backprop rather than a moonshot rewrite.
 code demo in the corresponding.py file
