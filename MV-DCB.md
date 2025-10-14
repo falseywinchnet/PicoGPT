@@ -48,6 +48,7 @@ Think of it as an **aimed first shove** that already respects the shape of the t
 ---
 
 ## What we appear to gain (from the experiments)
+Note- experiments were all done by human and variety tested.
 
 * **Comparable accuracy** to vanilla on easy/mid tasks, sometimes a small trade (±1–2%),
   but **better calibration** (lower ECE) and **steadier early training**.
