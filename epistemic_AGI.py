@@ -51,4 +51,7 @@ but the reason the LLM cannot- is not for a lack of knowledge.
 the LLM implicitly knows what fruits are. or rather, it knows that when thinking about fruits,
 what immediately follows are the fruits themselves. 
 it is for a lack of chinese remainder placement.
-
+it needs to do what a human does.
+it needs to simply take the concept for pomegranate and suddenly toss it into a space.
+it finds out what a pomagranate is like by simply asking what it isnt.
+its a top k where all semantic spaces are considered.
