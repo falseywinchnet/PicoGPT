@@ -251,6 +251,35 @@ class FlatRollEmbed(nn.Module):
     and S adds a single spike per row at column (r + M) % D, with M = argmax(x) and scale N = 1/(x[M]+eps).
 
     Works for any vocab_size V and embedding dim D.
+    Gauge-invariant fidelity be damned. Thou shalt not encode knowledge into thine embeddings!
+    in strict terms:
+    Yes, embeddings are coordinates. Without anchors you have a gauge freedom: if 
+    Y is good, so is YQ for any orthogonal Q
+    That means “meaning” isn’t tied to fixed axes; it lives only in relative geometry. 
+    Great for loss invariance, not great for epistemic stability.
+    Should any isometric copy of a solution be equally optimal?
+    This is ideal if each downstream task is trained (or fine-tuned) with the embedding.
+    But- that means embeddings CANNOT be reliable out of scope.
+    W trained on Y will fail on YQ unless you retrain/align(procrustes).
+    Make coordinates semantically stable so downstream learners can use fixed projections and 
+    avoid rebuilding a long “projection codebook.”
+    If you want to grow it later, you can slice it to a smaller vocab now, 
+    add more elements later, WITHOUT CHANGING YOUR EXISTING EMEDS.
+    In practice:
+    Retrieval/top-k neighbors are rotation-invariant, but feature-wise rules, sparse probes, 
+    decision boundaries, and any human- or system-interpretable logic are not. 
+    They implicitly assume anchored axes.
+    Truth is not relative. Truth is positional within a frame. 
+    Over time/checkpoints, anchor-free embeddings drift Q/T.
+    This means you cant build and distribute models where the embeddings need to adapt to the manifold,
+    and use distributed learning- they will wander out of scope.
+
+    FlatRoll’s philosophy is to trade off relational fidelity for coordinate identifiability: 
+    equidistant partitioning yields stable, interpretable axes and predictable neighborhoods. 
+    That’s epistemically friendly (zero/low re-training, robust to model drift).
+    Its exact math offers the *best* distance from any point and mean and simultaneous distinguishability.
+    That means that naively, it offers the best temperature packing.
+    
     """
 
     def __init__(self, config, scale: str = "box", seed: int = 0,
