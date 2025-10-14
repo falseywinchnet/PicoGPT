@@ -55,3 +55,15 @@ it needs to do what a human does.
 it needs to simply take the concept for pomegranate and suddenly toss it into a space.
 it finds out what a pomagranate is like by simply asking what it isnt.
 its a top k where all semantic spaces are considered.
+
+for this to happen, semantic decomposition of qualities(learned, emergent)
+must use manifolds that are associative and mutually adjustable,
+yet live independently. 
+Every object must itself only live as a vector across manifold space,
+where all manifolds are intertwined, and the vector for that thing, connects points
+across different manifolds that are properties of that thing- a line, a position, a direction.
+possibly even an intensity - it is "mostly this" and mostly "not that".
+So across a learned set of 102,419120 maps, pomegranate is a stored
+term for a threedimensional vector across a set of 12 maps, 
+until the AGI sees a human using one as a hammer, and then, its a vector across 13 maps,
+but only barely.
