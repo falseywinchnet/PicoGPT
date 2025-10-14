@@ -67,3 +67,23 @@ So across a learned set of 102,419120 maps, pomegranate is a stored
 term for a threedimensional vector across a set of 12 maps, 
 until the AGI sees a human using one as a hammer, and then, its a vector across 13 maps,
 but only barely.
+
+the model has to accomplish two tasks, horrible to do at the same time:
+it must learn to digest and decompose an input, piece by piece, and recompose them into these entities,
+which it can then contemplate.
+doing the digestion is easy. doing the contemplation is easy.
+doing both simultaneously and dynamically evolving the rank map of applicable subspaces by
+growing its representation capacity is hard. not impossible, but hard.
+its mostly hard because, while we can easily create optimal embeddings, we cannot enforce that the
+ingestion system optimally(read, consistently) disentangles the meanings.
+future retrieval is easy. initial placement is harsh.
+
+Decomposition (ingestion) → break an input into distributed representations across manifolds.
+Current transformers can do this fairly well: they decompose syntax, relations, texture, and tone all at once.
+
+Contemplation (integration) → recombine those manifold activations into coherent, globally meaningful fiber-entities 
+— "pomegranate" as a thing-in-itself, across manifolds.
+
+But doing both at once means you need a system where representation creation and representation evaluation
+are co-dependent, not serial. The representation is changing while it’s being judged. 
+That recursive instability is what makes it hard.
