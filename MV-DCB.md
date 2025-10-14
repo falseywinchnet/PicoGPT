@@ -2,7 +2,7 @@
 
 Traditional backprop sends error **through a single dot‑product channel** at each layer. That’s like trying to reposition a heavy table by pushing with **one finger** straight through the middle: you move, but you also skid, wobble, and waste effort.
 
-**MV‑DCB** treats everything as **coordinates** (inputs, activations, weights, logits) drawing off our thesis- see thesis.md- and moves them with a **small team of coordinated pushes**. At each layer it builds a tiny, data‑conditioned **span of directions** (2–4 vectors) that reflect the relevant local geometry **coupled to deeper layers**, projects the error into that span, and only then updates. You still use Adam/SGD exactly the same way; we only change *what gradient you feed them*.
+**MV‑DCB** treats everything as **coordinates** (inputs, activations, weights, logits) and moves them with a **small team of coordinated pushes**. At each layer it builds a tiny, data‑conditioned **span of directions** (2–4 vectors) that reflect the relevant local geometry **coupled to deeper layers**, projects the error into that span, and only then updates. You still use Adam/SGD exactly the same way; we only change *what gradient you feed them*.
 
 ---
 
