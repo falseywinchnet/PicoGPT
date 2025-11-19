@@ -23,60 +23,94 @@ class LayerNorm(nn.Module):
             self.bias = nn.Parameter(torch.zeros(ndim))
         else:
             self.register_parameter("bias", None)
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        b = self.bias if self.use_bias else None
+        b =self.bias if self.use_bias else None
         return F.layer_norm(x, self.weight.shape, self.weight, b, 1e-5)
 
 def variance_scaled_softmax(scores, dim: int = -1, eps: float = 1e-6):
+    # scores may contain -inf from masking
     finite = torch.isfinite(scores)
-    m = finite.to(scores.dtype)
-    n = m.sum(dim=dim, keepdim=True).clamp_min(1)
-    safe = torch.where(finite, scores, torch.zeros_like(scores))
-    mean = (safe * m).sum(dim=dim, keepdim=True) / n
-    var = ((safe - mean)**2 * m).sum(dim=dim, keepdim=True) / n
-    std = var.clamp_min(eps).sqrt()
-    scaled = (safe - mean) / std
-    scaled = torch.where(finite, scaled, float('-inf'))
+    m = finite.to(scores.dtype)                     # 1 where valid, 0 where masked
+    n = m.sum(dim=dim, keepdim=True).clamp_min(1)  # count of valid entries per row
+
+    # mean/var over valid entries only (population var)
+    safe_scores = torch.where(finite, scores, torch.zeros_like(scores))
+    mean = (safe_scores * m).sum(dim=dim, keepdim=True) / n
+    var  = ((safe_scores - mean)**2 * m).sum(dim=dim, keepdim=True) / n
+    std  = var.clamp_min(eps).sqrt()
+
+    scaled = (safe_scores - mean) / std
+    scaled = torch.where(finite, scaled, float('-inf'))  # restore mask
     out = torch.softmax(scaled, dim=dim)
-    return torch.where(n == 0, torch.zeros_like(out), out)
+    out = torch.where(n == 0, torch.zeros_like(out), out)  # fully-masked rows -> zeros
+    return out
+
+
+
+def norm(x):
+    # Purely functional rmsnorm with no learnable params
+    return F.rms_norm(x, (x.size(-1),))
+
+class ParsevalRotaryEmbedding(nn.Module):
+    def __init__(self, dim: int, max_seq_len: int = 2048, theta_base: float = 10000.0):
+        """
+        dim: embedding dimension (must be even).
+        max_seq_len: maximum sequence length for which to precompute sines/cosines.
+        theta_base: base for frequency schedule (as in RoPE).
+        """
+        super().__init__()
+        assert dim % 2 == 0, "dim must be even for pairing"
+        self.dim = dim
+        self.max_seq_len = max_seq_len
+
+        # compute frequency for each pair
+        half = dim // 2
+        inv_freq = 1.0 / (theta_base ** (torch.arange(0, half, 1, dtype=torch.float32) / half))
+
+        # position indices
+        pos = torch.arange(max_seq_len, dtype=torch.float32).unsqueeze(1)  # (max_seq_len,1)
+        # angles (max_seq_len x half) = pos * inv_freq
+        angles = pos * inv_freq.unsqueeze(0)  # broadcast
+        # compute cos and sin matrices for each pos and each half-dim
+        self.register_buffer("cos", angles.cos().unsqueeze(0).unsqueeze(0))  # (1,1,max_seq_len,half)
+        self.register_buffer("sin", angles.sin().unsqueeze(0).unsqueeze(0))
+
+    def forward(self, x: torch.Tensor, seq_pos: torch.Tensor):
+        """
+        x: shape (B, H, T, D) or (B, T, H, D)
+        seq_pos: tensor of positions indices shape (T,) or (B,T)
+        Returns: same shape x but positionally encoded via orthogonal rotations.
+        """
+        # assume shape (B, H, T, D)
+        B, H, T, D = x.shape
+        half = D // 2
+        # get cos/sin for positions
+        # pos angles shape (1,1,T,half)
+        cos_t = self.cos[:, :, seq_pos, :]  # broadcast
+        sin_t = self.sin[:, :, seq_pos, :]
+
+        x1 = x[..., :half]
+        x2 = x[..., half:]
+
+        # apply rotation: [x1'; x2'] = [x1*cos - x2*sin, x1*sin + x2*cos]
+        x1_rot = x1 * cos_t - x2 * sin_t
+        x2_rot = x1 * sin_t + x2 * cos_t
+
+        x_rot = torch.cat([x1_rot, x2_rot], dim=-1)
+        return x_rot
+
+
 
 def l2_normalize(x, dim=-1, eps=1e-8):
     return x / (x.norm(dim=dim, keepdim=True) + eps)
 
-class ParsevalRotaryEmbedding(nn.Module):
-    def __init__(self, dim: int, max_seq_len: int = 2048, theta_base: float = 10000.0):
-        super().__init__()
-        assert dim % 2 == 0
-        self.dim = dim
-        half = dim // 2
-        inv_freq = 1.0 / (theta_base ** (torch.arange(0, half, dtype=torch.float32) / half))
-        pos = torch.arange(max_seq_len, dtype=torch.float32).unsqueeze(1)
-        angles = pos * inv_freq.unsqueeze(0)  # (max_seq_len, half)
-        cos = angles.cos()   # (T, half)
-        sin = angles.sin()
-        # Register as (T, half) — no fake head dim
-        self.register_buffer("cos", cos)  # (max_seq_len, half)
-        self.register_buffer("sin", sin)
-
-    def forward(self, x: torch.Tensor, seq_pos: torch.Tensor):
-        """
-        x: (B, T, D)
-        seq_pos: (T,) int tensor of positions
-        """
-        # Get cos/sin for the actual positions, shape (T, half)
-        cos_t = self.cos[seq_pos]  # (T, half)
-        sin_t = self.sin[seq_pos]
-
-        # Expand to (B, T, half) for broadcasting
-        cos_t = cos_t.unsqueeze(0)  # (1, T, half)
-        sin_t = sin_t.unsqueeze(0)
-
-        x1, x2 = x[..., :self.dim//2], x[..., self.dim//2:]
-        x1_rot = x1 * cos_t - x2 * sin_t
-        x2_rot = x1 * sin_t + x2 * cos_t
-        return torch.cat([x1_rot, x2_rot], dim=-1)
-
 def build_haar_wavelet_basis(T, levels, device=None, dtype=torch.float32):
+    """
+    Build a Haar‐wavelet basis matrix W of shape (T, Bcoef).
+    T: sequence length (must be divisible by 2^levels for full structure, but we will allow slicing).
+    levels: number of levels of decomposition.
+    """
     W_list = []
     for j in range(levels):
         block_count = 2**j
@@ -85,94 +119,121 @@ def build_haar_wavelet_basis(T, levels, device=None, dtype=torch.float32):
         for k in range(block_count):
             vec = torch.zeros(T, dtype=dtype, device=device)
             start = k * block_size
-            mid = start + half
-            end = start + block_size
+            mid   = start + half
+            end   = start + block_size
             if half > 0:
-                vec[start:mid] = 1.0 / math.sqrt(half)
-                vec[mid:end] = -1.0 / math.sqrt(half)
+                vec[start:mid] =  1.0 / math.sqrt(half)
+                vec[mid:end]  = -1.0 / math.sqrt(half)
             W_list.append(vec)
-    return torch.stack(W_list, dim=1)
+    W = torch.stack(W_list, dim=1)  # shape (T, Bcoef)
+    return W
 
-# ——— FIXED HEADLESS WAVELET ATTENTION ———
-class ParsevalAttention(nn.Module):
-    def __init__(self, config, wavelet_levels=3, near_window=16):
+class WaveletAttention(nn.Module):
+    def __init__(self, config, wavelet_levels=3, near_window=64):
         super().__init__()
+        self.n_head = config.n_head
         self.n_embd = config.n_embd
-        self.head_dim = self.n_embd 
-        Dh  = self.head_dim
-        self.W_Q = nn.Parameter(torch.empty(Dh, self.n_embd))
+        self.head_dim = self.n_embd // self.n_head
+        assert self.n_embd % self.n_head == 0
+
+        H, Dh = self.n_head, self.head_dim
+
+        self.W_Q = nn.Parameter(torch.empty(H * Dh, self.n_embd))
         nn.init.xavier_uniform_(self.W_Q)
-        self.W_V = nn.Linear(self.n_embd,  Dh, bias=False)
-        self.W_O = nn.Linear( Dh, self.n_embd, bias=False)
+
+        self.W_V = nn.Linear(self.n_embd, H * Dh, bias=False)
+        self.W_O = nn.Linear(H * Dh, self.n_embd, bias=False)
+
         self.near_window = near_window
         self.wavelet_levels = wavelet_levels
         self.block_size = config.block_size
-        # Build maximum-size Haar basis once on CPU and register buffer.
+
+        # Build maximum‐size Haar basis once on CPU and register buffer.
         W_haar_full = build_haar_wavelet_basis(self.block_size,
                                                 self.wavelet_levels,
                                                 device='cpu')
         self.register_buffer("W_haar_full", W_haar_full)
+
         # Causal mask
         self.register_buffer(
             "mask",
             torch.tril(torch.ones(config.block_size, config.block_size))
-                 .view(1, config.block_size, config.block_size)
+                 .view(1, 1, config.block_size, config.block_size)
         )
         self.pos_encoder = ParsevalRotaryEmbedding(dim=Dh, max_seq_len=config.block_size)
 
     def compute_dual_WK(self):
-        #WQ = self.W_Q # (Dh, C)
-        ##WQ_star = WQ.conj().T # (C, Dh)
-        #Qmat, Rmat = torch.linalg.qr(WQ_star) # (C, Dh) = Q R
+        #WQ = self.W_Q                          # (H*Dh, C)
+        #WQ_star = WQ.conj().T                  # (C, H*Dh)
+        #Qmat, Rmat = torch.linalg.qr(WQ_star)  # (C, H*Dh) = Q R
         #R_inv = torch.inverse(Rmat)
-        #WK = R_inv @ Qmat.conj().T # (Dh, C)
+        #WK = R_inv @ Qmat.conj().T             # (H*Dh, C)
         #return WK
-        return torch.linalg.pinv(self.W_Q)  # single SVD-backed call, exact W_K
+        return torch.linalg.pinv(self.W_Q)   # one-line, hardware-accelerated, O(C D min(C,D))
 
     def forward(self, x ):
         B, T, C = x.size()
-        Dh  = self.head_dim
-        W_K = self.compute_dual_WK() # (H*Dh, C)
-        q = (x @ self.W_Q.T).view(B, T, Dh)
-        k = (x @ W_K.T).view(B, T, Dh)
-        v = self.W_V(x).view(B, T, Dh)
+        H, Dh = self.n_head, self.head_dim
+
+        W_K = self.compute_dual_WK()          # (H*Dh, C)
+
+        q = (x @ self.W_Q.T).view(B, T, H, Dh).transpose(1, 2)
+        k = (x @ W_K.T).view(B, T, H, Dh).transpose(1, 2)
+        v = self.W_V(x).view(B, T, H, Dh).transpose(1, 2)
         idx = torch.arange(T, device=x.device)
         q = self.pos_encoder(q, idx)
         k = self.pos_encoder(k, idx)
+
         q = l2_normalize(q, dim=-1)
         k = l2_normalize(k, dim=-1)
-        # Build near-field mask (causal, only past within window)
-        diff = idx.view(1, -1) - idx.view(-1, 1)  # diff[r, c] = r - c (positive for past)
-        near_mask = (diff >= 0) & (diff <= self.near_window)
-        # Compute near-field attention
-        att_near = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(Dh))
-        att_near = att_near.masked_fill(~near_mask.view(1, T, T), float('-inf'))
+
+        idx = torch.arange(T, device=x.device)
+        diff = idx.view(1, -1) - idx.view(-1, 1)
+        
+        # past within window 
+        near_mask = ((diff >= 0) & (diff <= self.near_window))
+        # Compute near‐field attention
+        att_near = (q @ k.transpose(-2,-1)) * (1.0 / math.sqrt(Dh))
+        att_near = att_near.masked_fill(~near_mask.view(1,1,T,T), float('-inf'))
+
         # Prepare Haar basis for current T
-        W_h_full = self.W_haar_full.to(x.device) # (block_size, Bcoef_full)
-        W_h = W_h_full[:T, :] # slice to (T, Bcoef_full)
-        # Project far-field q/k through basis
-        q2 = q.reshape(B, T, Dh)
-        k2 = k.reshape(B, T, Dh)
+        W_h_full = self.W_haar_full.to(x.device)       # (block_size, Bcoef_full)
+        W_h = W_h_full[:T, :]                           # slice to (T, Bcoef_full)
+
+        # Project far‐field q/k through basis
+        q2 = q.reshape(B*H, T, Dh)
+        k2 = k.reshape(B*H, T, Dh)
+
         # Compute projection
         # W_h.T: (Bcoef_full, T)
-        # q2: (B, T, Dh)
-        # -> result: (B, Bcoef_full, Dh)
-        q_far_proj = (W_h.T @ q2) # (B, Bcoef_full, Dh)
-        k_far_proj = (W_h.T @ k2) # same shape
-        # Compute far-field attention in compressed domain
-        att_far_comp = (q_far_proj @ k_far_proj.transpose(-2, -1)) * (1.0 / math.sqrt(Dh))
+        # q2:   (B*H, T, Dh)
+        # -> result: (B*H, Bcoef_full, Dh)
+        q_far_proj = (W_h.T @ q2)                     # (B*H, Bcoef_full, Dh)
+        k_far_proj = (W_h.T @ k2)                     # same shape
+
+        # Compute far‐field attention in compressed domain
+        att_far_comp = (q_far_proj @ k_far_proj.transpose(-2,-1)) * (1.0 / math.sqrt(Dh))
         # att_far_comp shape: (B*H, Bcoef_full, Bcoef_full)
+
         # Expand back to approximate full (T, T)
         # W_h: (T, Bcoef_full)
-        att_far_exp = (W_h @ att_far_comp) @ W_h.T # (T, Bcoef_full) @ (Bcoef_full, Bcoef_full) @ (Bcoef_full, T)
-        att_far_exp = att_far_exp.view(B,  T, T)
+        att_far_exp = (W_h @ att_far_comp) @ W_h.T     # (T, Bcoef_full) @ (Bcoef_full, Bcoef_full) @ (Bcoef_full, T)
+        att_far_exp = att_far_exp.view(B, H, T, T)
+
         # Combine near + far
-        att = torch.where(near_mask.view(1, T, T), att_near, att_far_exp)
+        att = torch.where(near_mask.view(1,1,T,T), att_near, att_far_exp)
+
         # Causal mask
-        att = att.masked_fill(self.mask[:, :T, :T] == 0, float('-inf'))
+        att = att.masked_fill(self.mask[:, :, :T, :T] == 0, float('-inf'))
+        
         att = variance_scaled_softmax(att, dim=-1)
-        y = att @ v # (B, T, Dh)
+
+        y = att @ v     # (B, H, T, Dh)
+        y = y.transpose(1,2).contiguous().view(B, T, H * Dh)
         return self.W_O(y)
+
+
+
 # ----------------------------
 # Transformer Block
 # ----------------------------
@@ -235,12 +296,12 @@ class Block(nn.Module):
         self.ln_1 = LayerNorm(config.n_embd, bias=config.bias)
 
         # new anchor before attention
-        self.anchor_pre = AnchorModule(config.n_embd,1) #think from outside in :)
+        self.anchor_pre = AnchorModule(config.n_embd,32) #think from outside in :)
 
-        self.attn = ParsevalAttention(config)
+        self.attn = WaveletAttention(config)
 
         # anchor after attention accumulation
-        self.anchor_post = AnchorModule(config.n_embd,1)
+        self.anchor_post = AnchorModule(config.n_embd,32)
 
         self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
         self.mlp = MLP(config)
@@ -248,6 +309,7 @@ class Block(nn.Module):
     def forward(self, x):
         # === pre-attention anchoring ===
         x_anch = self.anchor_pre(self.ln_1(x))
+
         # attention consumes outward-shifted x
         att = self.attn(x_anch)
 
@@ -340,4 +402,3 @@ class GPT(nn.Module):
             loss = None
 
         return logits, loss
-
