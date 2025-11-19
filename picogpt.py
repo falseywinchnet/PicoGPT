@@ -98,68 +98,80 @@ class ParsevalAttention(nn.Module):
     def __init__(self, config, wavelet_levels=3, near_window=16):
         super().__init__()
         self.n_embd = config.n_embd
-        self.block_size = config.block_size
+        self.head_dim = self.n_embd 
+        Dh  = self.head_dim
+        self.W_Q = nn.Parameter(torch.empty(Dh, self.n_embd))
+        nn.init.xavier_uniform_(self.W_Q)
+        self.W_V = nn.Linear(self.n_embd,  Dh, bias=False)
+        self.W_O = nn.Linear( Dh, self.n_embd, bias=False)
         self.near_window = near_window
         self.wavelet_levels = wavelet_levels
-        
-        self.W_Q = nn.Parameter(torch.empty(self.n_embd, self.n_embd))
-        nn.init.xavier_uniform_(self.W_Q)
-        
-        self.W_V = nn.Linear(self.n_embd, self.n_embd, bias=False)
-        self.W_O = nn.Linear(self.n_embd, self.n_embd, bias=False)
-        
-        W_full = build_haar_wavelet_basis(self.block_size, wavelet_levels, device='cpu')
-        self.register_buffer("W_haar_full", W_full)
-        
-        # Fixed: explicit bool tensor for causal masking
-        causal = torch.tril(torch.ones(self.block_size, self.block_size, dtype=torch.bool), diagonal=0)
-        self.register_buffer("causal_mask", causal)
-        
-        self.rope = ParsevalRotaryEmbedding(dim=self.n_embd, max_seq_len=self.block_size)
-    
-    def parseval_dual_WK(self):
-        return torch.linalg.pinv(self.W_Q)
-    
-    def forward(self, x):
-        B, T, C = x.shape
-        device = x.device
-        
-        WQ = self.W_Q
-        WK = self.parseval_dual_WK()
-        
-        q = x @ WQ
-        k = x @ WK.t()
-        v = self.W_V(x)
-        
-        pos = torch.arange(T, device=device)
-        q = self.rope(q, pos)
-        k = self.rope(k, pos)
+        self.block_size = config.block_size
+        # Build maximum-size Haar basis once on CPU and register buffer.
+        W_haar_full = build_haar_wavelet_basis(self.block_size,
+                                                self.wavelet_levels,
+                                                device='cpu')
+        self.register_buffer("W_haar_full", W_haar_full)
+        # Causal mask
+        self.register_buffer(
+            "mask",
+            torch.tril(torch.ones(config.block_size, config.block_size))
+                 .view(1, config.block_size, config.block_size)
+        )
+        self.pos_encoder = ParsevalRotaryEmbedding(dim=Dh, max_seq_len=config.block_size)
+
+    def compute_dual_WK(self):
+        #WQ = self.W_Q # (Dh, C)
+        ##WQ_star = WQ.conj().T # (C, Dh)
+        #Qmat, Rmat = torch.linalg.qr(WQ_star) # (C, Dh) = Q R
+        #R_inv = torch.inverse(Rmat)
+        #WK = R_inv @ Qmat.conj().T # (Dh, C)
+        #return WK
+        return torch.linalg.pinv(self.W_Q)  # single SVD-backed call, exact W_K
+
+    def forward(self, x ):
+        B, T, C = x.size()
+        Dh  = self.head_dim
+        W_K = self.compute_dual_WK() # (H*Dh, C)
+        q = (x @ self.W_Q.T).view(B, T, Dh)
+        k = (x @ W_K.T).view(B, T, Dh)
+        v = self.W_V(x).view(B, T, Dh)
+        idx = torch.arange(T, device=x.device)
+        q = self.pos_encoder(q, idx)
+        k = self.pos_encoder(k, idx)
         q = l2_normalize(q, dim=-1)
         k = l2_normalize(k, dim=-1)
-        
-        dist = pos.unsqueeze(0) - pos.unsqueeze(1)
-        near_mask = (dist >= 0) & (dist <= self.near_window)
-        
-        attn_scores = q @ k.transpose(-2, -1) / math.sqrt(C)
-        attn_near = attn_scores.masked_fill(~near_mask, float('-inf'))
-        
-        W_h = self.W_haar_full.to(device)[:T]
-        
-        q_coef = W_h.T @ q
-        k_coef = W_h.T @ k
-        attn_coef = q_coef @ k_coef.transpose(-2, -1) / math.sqrt(C)
-        attn_far = W_h @ attn_coef @ W_h.T
-        
-        attn = torch.where(near_mask, attn_near, attn_far)
-        
-        # Fixed line: causal_mask is now bool
-        attn = attn.masked_fill(~self.causal_mask[:T,:T], float('-inf'))
-        
-        n_visible = attn.isfinite().sum(-1, keepdim=True).clamp_min(1.0)
-        attn = attn / n_visible.sqrt()
-        attn = variance_scaled_softmax(attn, dim=-1)
-        
-        y = attn @ v
+        # Build near-field mask (causal, only past within window)
+        diff = idx.view(1, -1) - idx.view(-1, 1)  # diff[r, c] = r - c (positive for past)
+        near_mask = (diff >= 0) & (diff <= self.near_window)
+        # Compute near-field attention
+        att_near = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(Dh))
+        att_near = att_near.masked_fill(~near_mask.view(1, T, T), float('-inf'))
+        # Prepare Haar basis for current T
+        W_h_full = self.W_haar_full.to(x.device) # (block_size, Bcoef_full)
+        W_h = W_h_full[:T, :] # slice to (T, Bcoef_full)
+        # Project far-field q/k through basis
+        q2 = q.reshape(B, T, Dh)
+        k2 = k.reshape(B, T, Dh)
+        # Compute projection
+        # W_h.T: (Bcoef_full, T)
+        # q2: (B, T, Dh)
+        # -> result: (B, Bcoef_full, Dh)
+        q_far_proj = (W_h.T @ q2) # (B, Bcoef_full, Dh)
+        k_far_proj = (W_h.T @ k2) # same shape
+        # Compute far-field attention in compressed domain
+        att_far_comp = (q_far_proj @ k_far_proj.transpose(-2, -1)) * (1.0 / math.sqrt(Dh))
+        # att_far_comp shape: (B*H, Bcoef_full, Bcoef_full)
+        # Expand back to approximate full (T, T)
+        # W_h: (T, Bcoef_full)
+        att_far_exp = (W_h @ att_far_comp) @ W_h.T # (T, Bcoef_full) @ (Bcoef_full, Bcoef_full) @ (Bcoef_full, T)
+        att_far_exp = att_far_exp.view(B,  T, T)
+        # Combine near + far
+        att = torch.where(near_mask.view(1, T, T), att_near, att_far_exp)
+        # Causal mask
+        att = att.masked_fill(self.mask[:, :T, :T] == 0, float('-inf'))
+        att = variance_scaled_softmax(att, dim=-1)
+        y = att @ v # (B, T, Dh)
         return self.W_O(y)
 # ----------------------------
 # Transformer Block
@@ -329,139 +341,3 @@ class GPT(nn.Module):
 
         return logits, loss
 
-    def crop_block_size(self, block_size):
-        # model surgery to decrease the block size if necessary
-        # e.g. we may load the GPT2 pretrained model checkpoint (block size 1024)
-        # but want to use a smaller block size for some smaller, simpler model
-        assert block_size <= self.config.block_size
-        self.config.block_size = block_size
-        self.transformer.wpe.weight = nn.Parameter(self.transformer.wpe.weight[:block_size])
-        for block in self.transformer.h:
-            if hasattr(block.attn, 'bias'):
-                block.attn.bias = block.attn.bias[:,:,:block_size,:block_size]
-
-    @classmethod
-    def from_pretrained(cls, model_type, override_args=None):
-        assert model_type in {'gpt2', 'gpt2-medium', 'gpt2-large', 'gpt2-xl'}
-        override_args = override_args or {} # default to empty dict
-        # only dropout can be overridden see more notes below
-        assert all(k == 'dropout' for k in override_args)
-        from transformers import GPT2LMHeadModel
-        print("loading weights from pretrained gpt: %s" % model_type)
-
-        # n_layer, n_head and n_embd are determined from model_type
-        config_args = {
-            'gpt2':         dict(n_layer=12, n_head=12, n_embd=768),  # 124M params
-            'gpt2-medium':  dict(n_layer=24, n_head=16, n_embd=1024), # 350M params
-            'gpt2-large':   dict(n_layer=36, n_head=20, n_embd=1280), # 774M params
-            'gpt2-xl':      dict(n_layer=48, n_head=25, n_embd=1600), # 1558M params
-        }[model_type]
-        print("forcing vocab_size=50257, block_size=1024, bias=True")
-        config_args['vocab_size'] = 50257 # always 50257 for GPT model checkpoints
-        config_args['block_size'] = 1024 # always 1024 for GPT model checkpoints
-        config_args['bias'] = True # always True for GPT model checkpoints
-        # we can override the dropout rate, if desired
-        if 'dropout' in override_args:
-            print(f"overriding dropout rate to {override_args['dropout']}")
-            config_args['dropout'] = override_args['dropout']
-        # create a from-scratch initialized minGPT model
-        config = GPTConfig(**config_args)
-        model = GPT(config)
-        sd = model.state_dict()
-        sd_keys = sd.keys()
-        sd_keys = [k for k in sd_keys if not k.endswith('.attn.bias')] # discard this mask / buffer, not a param
-
-        # init a huggingface/transformers model
-        model_hf = GPT2LMHeadModel.from_pretrained(model_type)
-        sd_hf = model_hf.state_dict()
-
-        # copy while ensuring all of the parameters are aligned and match in names and shapes
-        sd_keys_hf = sd_hf.keys()
-        sd_keys_hf = [k for k in sd_keys_hf if not k.endswith('.attn.masked_bias')] # ignore these, just a buffer
-        sd_keys_hf = [k for k in sd_keys_hf if not k.endswith('.attn.bias')] # same, just the mask (buffer)
-        transposed = ['attn.c_attn.weight', 'attn.c_proj.weight', 'mlp.c_fc.weight', 'mlp.c_proj.weight']
-        # basically the openai checkpoints use a "Conv1D" module, but we only want to use a vanilla Linear
-        # this means that we have to transpose these weights when we import them
-        assert len(sd_keys_hf) == len(sd_keys), f"mismatched keys: {len(sd_keys_hf)} != {len(sd_keys)}"
-        for k in sd_keys_hf:
-            if any(k.endswith(w) for w in transposed):
-                # special treatment for the Conv1D weights we need to transpose
-                assert sd_hf[k].shape[::-1] == sd[k].shape
-                with torch.no_grad():
-                    sd[k].copy_(sd_hf[k].t())
-            else:
-                # vanilla copy over the other parameters
-                assert sd_hf[k].shape == sd[k].shape
-                with torch.no_grad():
-                    sd[k].copy_(sd_hf[k])
-
-        return model
-
-    def configure_optimizers(self, weight_decay, learning_rate, betas, device_type):
-        # start with all of the candidate parameters
-        param_dict = {pn: p for pn, p in self.named_parameters()}
-        # filter out those that do not require grad
-        param_dict = {pn: p for pn, p in param_dict.items() if p.requires_grad}
-        # create optim groups. Any parameters that is 2D will be weight decayed, otherwise no.
-        # i.e. all weight tensors in matmuls + embeddings decay, all biases and layernorms don't.
-        decay_params = [p for n, p in param_dict.items() if p.dim() >= 2]
-        nodecay_params = [p for n, p in param_dict.items() if p.dim() < 2]
-        optim_groups = [
-            {'params': decay_params, 'weight_decay': weight_decay},
-            {'params': nodecay_params, 'weight_decay': 0.0}
-        ]
-        num_decay_params = sum(p.numel() for p in decay_params)
-        num_nodecay_params = sum(p.numel() for p in nodecay_params)
-        print(f"num decayed parameter tensors: {len(decay_params)}, with {num_decay_params:,} parameters")
-        print(f"num non-decayed parameter tensors: {len(nodecay_params)}, with {num_nodecay_params:,} parameters")
-        # Create AdamW optimizer and use the fused version if it is available
-        fused_available = 'fused' in inspect.signature(torch.optim.AdamW).parameters
-        use_fused = fused_available and device_type == 'cuda'
-        extra_args = dict(fused=True) if use_fused else dict()
-        optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=betas, **extra_args)
-        print(f"using fused AdamW: {use_fused}")
-
-        return optimizer
-
-    def estimate_mfu(self, fwdbwd_per_iter, dt):
-        """ estimate model flops utilization (MFU) in units of A100 bfloat16 peak FLOPS """
-        # first estimate the number of flops we do per iteration.
-        # see PaLM paper Appendix B as ref: https://arxiv.org/abs/2204.02311
-        N = self.get_num_params()
-        cfg = self.config
-        L, H, Q, T = cfg.n_layer, cfg.n_head, cfg.n_embd//cfg.n_head, cfg.block_size
-        flops_per_token = 6*N + 12*L*H*Q*T
-        flops_per_fwdbwd = flops_per_token * T
-        flops_per_iter = flops_per_fwdbwd * fwdbwd_per_iter
-        # express our flops throughput as ratio of A100 bfloat16 peak flops
-        flops_achieved = flops_per_iter * (1.0/dt) # per second
-        flops_promised = 312e12 # A100 GPU bfloat16 peak flops is 312 TFLOPS
-        mfu = flops_achieved / flops_promised
-        return mfu
-
-    @torch.no_grad()
-    def generate(self, idx, max_new_tokens, temperature=1.0, top_k=None):
-        """
-        Take a conditioning sequence of indices idx (LongTensor of shape (b,t)) and complete
-        the sequence max_new_tokens times, feeding the predictions back into the model each time.
-        Most likely you'll want to make sure to be in model.eval() mode of operation for this.
-        """
-        for _ in range(max_new_tokens):
-            # if the sequence context is growing too long we must crop it at block_size
-            idx_cond = idx if idx.size(1) <= self.config.block_size else idx[:, -self.config.block_size:]
-            # forward the model to get the logits for the index in the sequence
-            logits, _ = self(idx_cond)
-            # pluck the logits at the final step and scale by desired temperature
-            logits = logits[:, -1, :] / temperature
-            # optionally crop the logits to only the top k options
-            if top_k is not None:
-                v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
-                logits[logits < v[:, [-1]]] = -float('Inf')
-            # apply softmax to convert logits to (normalized) probabilities
-            probs = F.softmax(logits, dim=-1)
-            # sample from the distribution
-            idx_next = torch.multinomial(probs, num_samples=1)
-            # append sampled index to the running sequence and continue
-            idx = torch.cat((idx, idx_next), dim=1)
-
-        return idx
