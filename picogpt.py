@@ -73,8 +73,8 @@ class ParsevalRotaryEmbedding(nn.Module):
         # angles (max_seq_len x half) = pos * inv_freq
         angles = pos * inv_freq.unsqueeze(0)  # broadcast
         # compute cos and sin matrices for each pos and each half-dim
-        self.register_buffer("cos", angles.cos().unsqueeze(0).unsqueeze(0))  # (1,1,max_seq_len,half)
-        self.register_buffer("sin", angles.sin().unsqueeze(0).unsqueeze(0))
+        self.register_buffer("cos", angles.cos().unsqueeze(0))  # (1,1,max_seq_len,half)
+        self.register_buffer("sin", angles.sin().unsqueeze(0))
 
     def forward(self, x: torch.Tensor, seq_pos: torch.Tensor):
         """
@@ -82,13 +82,12 @@ class ParsevalRotaryEmbedding(nn.Module):
         seq_pos: tensor of positions indices shape (T,) or (B,T)
         Returns: same shape x but positionally encoded via orthogonal rotations.
         """
-        # assume shape (B, H, T, D)
-        B, H, T, D = x.shape
+        B,  T, D = x.shape
         half = D // 2
         # get cos/sin for positions
         # pos angles shape (1,1,T,half)
-        cos_t = self.cos[:, :, seq_pos, :]  # broadcast
-        sin_t = self.sin[:, :, seq_pos, :]
+        cos_t = self.cos[:, seq_pos, :]  # broadcast
+        sin_t = self.sin[:, seq_pos, :]
 
         x1 = x[..., :half]
         x2 = x[..., half:]
@@ -129,20 +128,18 @@ def build_haar_wavelet_basis(T, levels, device=None, dtype=torch.float32):
     return W
 
 class WaveletAttention(nn.Module):
-    def __init__(self, config, wavelet_levels=3, near_window=64):
+    def __init__(self, config, wavelet_levels=6, near_window=8):
         super().__init__()
         self.n_head = config.n_head
         self.n_embd = config.n_embd
-        self.head_dim = self.n_embd // self.n_head
-        assert self.n_embd % self.n_head == 0
+     
+        Dh =  self.n_embd 
 
-        H, Dh = self.n_head, self.head_dim
-
-        self.W_Q = nn.Parameter(torch.empty(H * Dh, self.n_embd))
+        self.W_Q = nn.Parameter(torch.empty(Dh, self.n_embd))
         nn.init.xavier_uniform_(self.W_Q)
 
-        self.W_V = nn.Linear(self.n_embd, H * Dh, bias=False)
-        self.W_O = nn.Linear(H * Dh, self.n_embd, bias=False)
+        self.W_V = nn.Linear(self.n_embd,  Dh, bias=False)
+        self.W_O = nn.Linear(Dh, self.n_embd, bias=False)
 
         self.near_window = near_window
         self.wavelet_levels = wavelet_levels
@@ -158,7 +155,7 @@ class WaveletAttention(nn.Module):
         self.register_buffer(
             "mask",
             torch.tril(torch.ones(config.block_size, config.block_size))
-                 .view(1, 1, config.block_size, config.block_size)
+                 .view(1,  config.block_size, config.block_size)
         )
         self.pos_encoder = ParsevalRotaryEmbedding(dim=Dh, max_seq_len=config.block_size)
 
@@ -169,17 +166,17 @@ class WaveletAttention(nn.Module):
         #R_inv = torch.inverse(Rmat)
         #WK = R_inv @ Qmat.conj().T             # (H*Dh, C)
         #return WK
-        return torch.linalg.pinv(self.W_Q)   # one-line, hardware-accelerated, O(C D min(C,D))
+        return torch.linalg.pinv(self.W_Q).T  #fast equivalent 
 
     def forward(self, x ):
         B, T, C = x.size()
-        H, Dh = self.n_head, self.head_dim
+        Dh= self.n_embd
 
         W_K = self.compute_dual_WK()          # (H*Dh, C)
 
-        q = (x @ self.W_Q.T).view(B, T, H, Dh).transpose(1, 2)
-        k = (x @ W_K.T).view(B, T, H, Dh).transpose(1, 2)
-        v = self.W_V(x).view(B, T, H, Dh).transpose(1, 2)
+        q = (x @ self.W_Q.T).view(B, T, Dh)
+        k = (x @ W_K.T).view(B, T, Dh)
+        v = self.W_V(x).view(B, T, Dh)
         idx = torch.arange(T, device=x.device)
         q = self.pos_encoder(q, idx)
         k = self.pos_encoder(k, idx)
@@ -194,15 +191,15 @@ class WaveletAttention(nn.Module):
         near_mask = ((diff >= 0) & (diff <= self.near_window))
         # Compute near‐field attention
         att_near = (q @ k.transpose(-2,-1)) * (1.0 / math.sqrt(Dh))
-        att_near = att_near.masked_fill(~near_mask.view(1,1,T,T), float('-inf'))
+        att_near = att_near.masked_fill(~near_mask.view(1,T,T), float('-inf'))
 
         # Prepare Haar basis for current T
         W_h_full = self.W_haar_full.to(x.device)       # (block_size, Bcoef_full)
         W_h = W_h_full[:T, :]                           # slice to (T, Bcoef_full)
 
         # Project far‐field q/k through basis
-        q2 = q.reshape(B*H, T, Dh)
-        k2 = k.reshape(B*H, T, Dh)
+        q2 = q.reshape(B, T, Dh)
+        k2 = k.reshape(B, T, Dh)
 
         # Compute projection
         # W_h.T: (Bcoef_full, T)
@@ -218,18 +215,18 @@ class WaveletAttention(nn.Module):
         # Expand back to approximate full (T, T)
         # W_h: (T, Bcoef_full)
         att_far_exp = (W_h @ att_far_comp) @ W_h.T     # (T, Bcoef_full) @ (Bcoef_full, Bcoef_full) @ (Bcoef_full, T)
-        att_far_exp = att_far_exp.view(B, H, T, T)
+        att_far_exp = att_far_exp.view(B,  T, T)
 
         # Combine near + far
-        att = torch.where(near_mask.view(1,1,T,T), att_near, att_far_exp)
+        att = torch.where(near_mask.view(1,T,T), att_near, att_far_exp)
 
         # Causal mask
-        att = att.masked_fill(self.mask[:, :, :T, :T] == 0, float('-inf'))
+        att = att.masked_fill(self.mask[:,  :T, :T] == 0, float('-inf'))
         
         att = variance_scaled_softmax(att, dim=-1)
 
         y = att @ v     # (B, H, T, Dh)
-        y = y.transpose(1,2).contiguous().view(B, T, H * Dh)
+        y = y
         return self.W_O(y)
 
 
@@ -296,19 +293,19 @@ class Block(nn.Module):
         self.ln_1 = LayerNorm(config.n_embd, bias=config.bias)
 
         # new anchor before attention
-        self.anchor_pre = AnchorModule(config.n_embd,32) #think from outside in :)
+        self.anchor_pre = AnchorModule(config.n_embd,1) #think from outside in :)
 
         self.attn = WaveletAttention(config)
 
         # anchor after attention accumulation
-        self.anchor_post = AnchorModule(config.n_embd,32)
+        self.anchor_post = AnchorModule(config.n_embd,1)
 
         self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
         self.mlp = MLP(config)
 
     def forward(self, x):
         # === pre-attention anchoring ===
-        x_anch = self.anchor_pre(self.ln_1(x))
+        x_anch = self.ln_1(x)
 
         # attention consumes outward-shifted x
         att = self.attn(x_anch)
@@ -317,7 +314,6 @@ class Block(nn.Module):
         x = x + att
 
         # === re-anchor after attention ===
-        x = self.anchor_post(x)#todo- can use anchor_pre here too? maybe?
 
         # standard MLP block
         x = x + self.mlp(self.ln_2(x))
