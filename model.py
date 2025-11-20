@@ -27,10 +27,16 @@ class LayerNorm(nn.Module):
         b =self.bias if self.use_bias else None
         return F.layer_norm(x, self.weight.shape, self.weight, b, 1e-5)
 
-
-def l2_normalize(x, dim=-1, eps=1e-8):
-    return x / (x.norm(dim=dim, keepdim=True) + eps)
-
+def l2_normalize(x, dim=-1, eps=1e-6):
+    # Cast to float32 for the norm calculation to prevent overflow (x^2)
+    # and underflow (precision loss).
+    x_float = x.float()
+    norm = x_float.norm(dim=dim, keepdim=True)
+    
+    # Result is cast back to original dtype automatically by division if x is fp16,
+    # but explicit casting ensures control.
+    return x / (norm.to(x.dtype) + eps)
+    
 
 class ParsevalRotaryEmbedding(nn.Module):
     def __init__(self, dim: int, max_seq_len: int = 2048, theta_base: float = 10000.0):
@@ -80,6 +86,7 @@ class ParsevalRotaryEmbedding(nn.Module):
         x_rot = torch.cat([x1_rot, x2_rot], dim=-1)
         return x_rot
 
+
 def build_haar_wavelet_basis(T, levels, device=None, dtype=torch.float32):
     """
     Build a Haar‐wavelet basis matrix W of shape (T, Bcoef).
@@ -105,21 +112,34 @@ def build_haar_wavelet_basis(T, levels, device=None, dtype=torch.float32):
 
 def variance_scaled_softmax(scores, dim: int = -1, eps: float = 1e-6):
     # scores may contain -inf from masking
-    finite = torch.isfinite(scores)
-    m = finite.to(scores.dtype)                     # 1 where valid, 0 where masked
+    # Always compute softmax stats in float32
+    dtype_in = scores.dtype
+    scores_f32 = scores.float()
+    
+    finite = torch.isfinite(scores_f32)
+    m = finite.to(scores_f32.dtype)                     # 1 where valid, 0 where masked
     n = m.sum(dim=dim, keepdim=True).clamp_min(1)  # count of valid entries per row
 
     # mean/var over valid entries only (population var)
-    safe_scores = torch.where(finite, scores, torch.zeros_like(scores))
+    safe_scores = torch.where(finite, scores_f32, torch.zeros_like(scores_f32))
     mean = (safe_scores * m).sum(dim=dim, keepdim=True) / n
+    
+    # Squaring difference is risky in fp16, safe in fp32
     var  = ((safe_scores - mean)**2 * m).sum(dim=dim, keepdim=True) / n
     std  = var.clamp_min(eps).sqrt()
 
     scaled = (safe_scores - mean) / std
-    scaled = torch.where(finite, scaled, float('-inf'))  # restore mask
+    
+    # Restore -inf mask for softmax
+    # We use float('-inf') which is valid in float32
+    scaled = torch.where(finite, scaled, float('-inf'))
+    
+    # Softmax in float32 is standard stability practice
     out = torch.softmax(scaled, dim=dim)
-    out = torch.where(n == 0, torch.zeros_like(out), out)  # fully-masked rows -> zeros
-    return out
+    out = torch.where(n == 0, torch.zeros_like(out), out)
+    
+    # Cast back to original dtype (fp16)
+    return out.to(dtype_in)
 
 class DirectionalWedgeBias(nn.Module):
     def __init__(self, dim, heads, max_seq_len=1024, gamma=1.0):
@@ -145,23 +165,39 @@ class DirectionalWedgeBias(nn.Module):
         H, Dh = self.n_head, self.head_dim
         
         # 1. Compute Wedge Geometry
+        # Transpose and view
         v = x.view(B, T, H, Dh).transpose(1, 2) # (B, H, T, Dh)
-        v = F.normalize(v, dim=-1) 
         
-        S = self.A - self.A.transpose(-1, -2) # (H, Dh, Dh)
-        Sv = torch.matmul(v, S) 
-        wedge = torch.matmul(Sv, v.transpose(-1, -2)) # (B, H, T, T)
+        # --- FLOAT32 SAFEGUARD START ---
+        # We perform the normalization and geometric projections in float32
+        # to avoid exploding norms and loss of precision in the 'wedge' product.
+        v_f32 = v.float()
+        
+        # rsqrt is safer, but we must prevent the square sum from overflowing first
+        sq_norm = (v_f32 ** 2).sum(dim=-1, keepdim=True)
+        
+        # Normalize
+        v_norm = v_f32 * torch.rsqrt(sq_norm + 1e-6)
+        
+        # Projection matrix S needs to be float32 for this operation
+        # (casting on the fly is cheap compared to the instability risk)
+        A_f32 = self.A.float()
+        S = A_f32 - A_f32.transpose(-1, -2) # (H, Dh, Dh)
+        
+        Sv = torch.matmul(v_norm, S) 
+        wedge = torch.matmul(Sv, v_norm.transpose(-1, -2)) # (B, H, T, T)
+        
+        # Cast back to fp16 (or bf16) for the decay and output
+        wedge = wedge.to(x.dtype)
+        # --- FLOAT32 SAFEGUARD END ---
         
         # 2. Apply Decay using Cached Distance
-        # Slice the cache to current T
         dist = self.dist_cache[:, :, :T, :T]
         
-        # Compute decay. Note: We still must compute exp() as tau is learnable,
-        # but we avoid generating the huge 'dist' tensor from scratch.
         tau = F.softplus(self.log_tau).view(1, H, 1, 1) + 1e-4
         decay = torch.exp(-dist * 0.01 / tau) 
 
-        return self.gamma * wedge * decay
+        return self.gamma * wedge * decay        
 
 class ParsevalWaveletAttention(nn.Module):
     def __init__(self, config, near_window=64):
@@ -218,7 +254,11 @@ class ParsevalWaveletAttention(nn.Module):
         q = self.W_Q(x).view(B, T, H, D).transpose(1, 2) # (B, H, T, D)
         k = self.W_K(x).view(B, T, H, D).transpose(1, 2)
         v = self.W_V(self.ln(x)).view(B, T, H, D).transpose(1, 2)
-        
+        idx = torch.arange(T, device=x.device)
+
+        q = self.pos_encoder(q, idx)
+        k = self.pos_encoder(k, idx)
+
         # L2 Normalize
         q = l2_normalize(q, dim=-1)
         k = l2_normalize(k, dim=-1)
@@ -253,22 +293,29 @@ class ParsevalWaveletAttention(nn.Module):
         # 4. Compute Near Field (Sparse Override)
         # ---------------------------------------------------------
         # Create indices for mask
-        q_sq = (q**2).sum(dim=-1, keepdim=True) # (B, H, T, 1)
-        k_sq = (k**2).sum(dim=-1, keepdim=True) # (B, H, T, 1)
-        k_sq_T = k_sq.transpose(-2, -1)         # (B, H, 1, T)
-        charge_product = q @ k.transpose(-2, -1)
-        # Squared Euclidean Distance in latent space
-        dist_sq = q_sq + k_sq_T - 2 * charge_product
-        # Plummer Softening
-        softened_dist = dist_sq + 1.0 
-        coulomb_scores = charge_product / softened_dist
-        
-        idx = torch.arange(T, device=x.device)
         # Band mask (Boolean)
         near_mask = (idx.view(1,-1) - idx.view(-1,1)).abs() <= self.near_window
         near_mask = near_mask.view(1, 1, T, T)
-
-        att = torch.where(near_mask, coulomb_scores + geo_bias, att)
+        
+        # Compute Near Attention
+        # We only strictly need to compute this, but without a banded kernel 
+        # we must compute the full matrix. However, we can optimize the combination.
+        att_near = q @ k.transpose(-2, -1)
+        
+        # Fused combination:
+        # Instead of torch.where (which allocates a 3rd tensor), we use masked write.
+        # att[near_mask] = att_near[near_mask] + geo_bias[near_mask]
+        # Since we already added geo_bias to 'att', we just need to replace 
+        # the specific values where the near mask is active.
+        
+        # Note: att currently contains (Far + Bias). 
+        # We want (Near + Bias) where mask is True.
+        # So: att[mask] = Near + Bias
+        # We can extract just the masked elements to save memory bandwidth
+        
+        # Efficient update:
+        att = torch.where(near_mask, att_near + geo_bias, att)
+        
         # Apply Causal Mask
         att = att.masked_fill(self.causal_mask[:, :, :T, :T] == 0, float('-inf'))
         
@@ -280,7 +327,10 @@ class ParsevalWaveletAttention(nn.Module):
         null_scores = q @ k_null_ex.transpose(-2, -1)
         
         att_full = torch.cat([att, null_scores], dim=-1)
-                
+        
+        # Cleanup large tensors before Softmax to free graph memory if possible
+        del att_near, geo_bias, q_far, k_far
+        
         att_full = variance_scaled_softmax(att_full, dim=-1)
         
         # Weighted Sum
