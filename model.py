@@ -252,7 +252,7 @@ class DirectionalWedgeBias(nn.Module):
 class ParsevalWaveletAttention(nn.Module):
     def __init__(self, config, near_window=64):
         super().__init__()
-        self.n_head = config.n_head
+        self.n_head = config.n_head//4#(shrink down, we use virtual heads)
         self.n_embd = config.n_embd
         self.head_dim = self.n_embd // self.n_head
         
@@ -483,6 +483,71 @@ class MLP(nn.Module):
         x = self.dropout(x)
         return x
 
+
+class ExpertReadout(nn.Module):
+    """
+    Packs K linear experts: y = sum_k g[...,k]*(h @ W_k^T + b_k)
+    Vectorized via einsum; no loops.
+    """
+    def __init__(self, hidden, out_dim, K):
+        super().__init__()
+        self.W = nn.Parameter(torch.empty(K, out_dim, hidden))
+        self.b = nn.Parameter(torch.zeros(K, out_dim))
+        nn.init.kaiming_uniform_(self.W, a=math.sqrt(5))
+        bound = 1.0 / math.sqrt(hidden)
+        nn.init.uniform_(self.b, -bound, bound)
+        self.K = K
+        self.out_dim = out_dim
+        self.hidden = hidden
+
+    def y_all(self, h):   # h: [B,T,H] -> [B,T,K,O]
+        return torch.einsum('bth,koh->btko', h, self.W) + self.b
+
+    def combine(self, g, y_all):  # g: [B,T,K], y_all: [B,T,K,O] -> [B,T,O]
+        return torch.einsum('btk,btko->bto', g, y_all)
+
+def hard_onehot_softgrad(logits, dim=-1):
+    # straight-through argmax with soft gradient
+    probs = F.softmax(logits, dim=dim)
+    hard = F.one_hot(probs.argmax(dim=dim), num_classes=probs.size(dim)).float()
+    return (hard - probs).detach() + probs
+
+# -----------------------------
+# Models
+# -----------------------------
+class TemporalMoE(nn.Module):
+    # Gate(t) from h_{t-1}; Values from h_t
+    def __init__(self, in_dim, hidden, out_dim, K):
+        super().__init__()
+        self.fc1  = nn.Linear(in_dim, hidden)
+        self.gate = nn.Linear(hidden, K)
+        self.exp  = ExpertReadout(hidden, out_dim, K)
+        self.K = K
+
+    def forward(self, x):  # x:[B,T,C]
+        h = F.gelu(self.fc1(x))                     # [B,T,H]
+        g_logits = self.gate(h)                     # [B,T,K]
+        g_prev = torch.roll(g_logits, 1, dims=1)
+        g_prev[:, 0, :] = 0.0
+        g = hard_onehot_softgrad(g_prev, dim=-1)    # [B,T,K] (hard, STE)
+        y_all = self.exp.y_all(h)                   # [B,T,K,O]
+        y = self.exp.combine(g, y_all)              # [B,T,O]
+        return y
+
+class ConvolvedSignalMoE(nn.Module):
+    # Gate(t) from *causal conv(h)*; Values from h_t (local)
+    def __init__(self, in_dim, hidden, out_dim, K, kw=5):
+        super().__init__()
+        self.fc1  = nn.Linear(in_dim, hidden)
+        self.gate = nn.Linear(hidden, K)
+        self.exp  = ExpertReadout(hidden, out_dim, K)
+
+    def forward(self, x):
+        h = F.gelu(self.fc1(x))                     # [B,T,H]
+        g = hard_onehot_softgrad(self.gate(h))      # [B,T,K]
+        y_all = self.exp.y_all(h)                   # [B,T,K,O]
+        return self.exp.combine(g, y_all)
+        
 class ParsevalAnchor(nn.Module):
     """
     A grounded, Parseval-compliant version of the AnchorModule.
@@ -556,15 +621,27 @@ class Block(nn.Module):
         
         # [Anchor Pre-Attn] The "Diffractor"
         # Forces tokens to be distinct before they enter the Attention averaging mechanism.
-        self.anchor_pre = ParsevalAnchor(config.n_embd, n_anchor=32)
+        self.anchor_pre = ParsevalAnchor(config.n_embd, n_anchor=config.n_head)
         
         self.attn = ParsevalWaveletAttention(config)
         
        
-        self.anchor_post = ParsevalAnchor(config.n_embd, n_anchor=32)
+        self.anchor_post = ParsevalAnchor(config.n_embd, n_anchor=config.n_head)
         
         self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
-        self.mlp = MLP(config)
+        self.mlp = MLP(config) #todo : swap for better memory mechanism, like routed of some kind
+        #we have also tried ALBERT-style take the attn and try them on multiple MLP->V and accumulate.
+        #i think, personally, that this has promise- build a routed -K using attn scoring on MLP experts,
+        #hard route to the MLP that matches + a soft route mix.
+        #ie take TemporalMoE for the soft route, and use
+        #Theory, Analysis, and Best Practices for
+        #Sigmoid Self-Attention to design some forking approach to attn- ie
+        #return the final attn manifold and do some further tweaking to it and apply it
+        #to the output of a bunch of V with sigmoid and use that to do hard routed.
+
+       #papers we'd like to further examine or consider the theoretical implications are in this repo.
+
+
 
     def forward(self, x):
         # Pre-Anchor -> LN -> Attn
@@ -585,14 +662,12 @@ class Block(nn.Module):
 
 @dataclass
 class GPTConfig:
-    block_size: int = 1024
-    vocab_size: int = 50304 # GPT-2 vocab_size of 50257, padded up to nearest multiple of 64 for efficiency
-    n_layer: int = 12
-    n_head: int = 12
-    n_embd: int = 768
-    dropout: float = 0.0
-    bias: bool = True # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
-
+    block_size: int = 8192
+    vocab_size: int = 262144  # qwern vocab size rounded up
+    n_layer: int = 24
+    n_head: int = 32 #we actually are using 8 heads here with virtual heads for agumentation
+    n_embd: int = 2048
+    
 class GPT(nn.Module):
 
     def __init__(self, config):
