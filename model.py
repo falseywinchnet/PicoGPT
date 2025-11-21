@@ -483,16 +483,103 @@ class MLP(nn.Module):
         x = self.dropout(x)
         return x
 
+class ParsevalAnchor(nn.Module):
+    """
+    A grounded, Parseval-compliant version of the AnchorModule.
+    Acts as a 'Virtual Multi-Head' system by orthogonalizing tokens
+    against a fixed set of 'Hub' concepts on the manifold.
+    """
+    def __init__(self, dim, n_anchor=32):
+        super().__init__()
+        self.dim = dim
+        # Learnable anchors, strictly normalized (Points on the sphere)
+        # We initialize them orthogonally to ensure maximum coverage of the space
+        # with minimum overlap (Frame Theory: Tight Frame).
+        self.anchors = nn.Parameter(torch.empty(n_anchor, dim))
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        # Orthogonal initialization ensures anchors cover the space evenly
+        # effectively creating a uniform Voronoi tessellation.
+        nn.init.orthogonal_(self.anchors)
+
+    def forward(self, x):
+        """
+        x: (B, T, C)
+        """
+        # 1. Normalize Anchors (Enforce Sphere)
+        # The anchors act as the centroids of the Voronoi cells.
+        anchors = l2_normalize(self.anchors, dim=-1)
+        
+        # 2. Project x onto Anchors (Find the "Hub" component)
+        # (B, T, C) @ (C, A) -> (B, T, A)
+        sim = x @ anchors.t()
+        
+        # Softmax gives the "barycentric coordinates" relative to anchors
+        # This tells us which "Virtual Head" this token belongs to.
+        w = F.softmax(sim, dim=-1)
+        
+        # 3. Reconstruct the "Common" component
+        recon = w @ anchors # (B, T, C)
+        
+        # 4. Compute the "Unique" component (Residual)
+        # This vector points from the 'Average' towards the 'Specific'.
+        # In a single-head model, this preserves the nuances that averaging destroys.
+        resid = x - recon
+        
+        # 5. The Transplant Fix (Parseval Style):
+        # We project x onto the residual direction to isolate the unique signal,
+        # then mix it back. This acts as a High-Pass Filter on the manifold.
+        
+        # Normalize residual to get direction
+        resid_dir = l2_normalize(resid, dim=-1)
+        
+        # How much of x is unique?
+        unique_mag = (x * resid_dir).sum(dim=-1, keepdim=True)
+        
+        # We boost the unique component. 
+        # 0.5 is a conservative gain. High gain = more distinctness but less cohesion.
+        x_sharp = x + 0.5 * resid 
+        
+        # 6. Critical: Renormalize to input norm to satisfy Parseval
+        # We preserve the Energy (Norm) of the input, but redistribute it 
+        # away from the "Mean" and towards the "Unique".
+        input_norm = x.norm(dim=-1, keepdim=True)
+        x_out = l2_normalize(x_sharp, dim=-1) * input_norm
+        
+        return x_out
+
 class Block(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.ln_1 = LayerNorm(config.n_embd, bias=config.bias)
+        
+        # [Anchor Pre-Attn] The "Diffractor"
+        # Forces tokens to be distinct before they enter the Attention averaging mechanism.
+        self.anchor_pre = ParsevalAnchor(config.n_embd, n_anchor=32)
+        
         self.attn = ParsevalWaveletAttention(config)
+        
+       
+        self.anchor_post = ParsevalAnchor(config.n_embd, n_anchor=32)
+        
         self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
         self.mlp = MLP(config)
 
     def forward(self, x):
-        x = x + self.attn(self.ln_1(x))
+        # Pre-Anchor -> LN -> Attn
+        # We apply anchor BEFORE LayerNorm to shape the distribution before normalization
+        x_anch = self.anchor_pre(x)
+        
+        # Attention
+        x = x + self.attn(self.ln_1(x_anch))
+        
+        # Post-Anchor
+        # We anchor the residual stream itself
+        #todo: determine if running without this is just as good
+        x = self.anchor_post(x)
+        
+        # MLP
         x = x + self.mlp(self.ln_2(x))
         return x
 
