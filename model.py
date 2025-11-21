@@ -294,11 +294,12 @@ class ParsevalWaveletAttention(nn.Module):
         # We use near_window as the fundamental atomic unit of "Time"
         BLK = self.near_window
         
-        # Pad T to be a multiple of BLK for reshaping
+        # Pad T to be a multiple of BLK for reshaping        
         pad_len = (BLK - (T % BLK)) % BLK
         if pad_len > 0:
-            # Pad with zeros (masked out later anyway)
-            x_padded = F.pad(x, (0, 0, 0, 0, 0, pad_len))
+            # [FIX] Pad only the Time dimension (dim -2). 
+            # Tuple is (LastDim_Left, LastDim_Right, 2ndLast_Left, 2ndLast_Right)
+            x_padded = F.pad(x, (0, 0, 0, pad_len)) 
             T_pad = T + pad_len
         else:
             x_padded = x
