@@ -49,22 +49,15 @@ This implementation balances opposing forces to create a stable, differentiable 
 4. Scalar Sink (Entropy): Absorbs confusion isotropicallly. Entropic Force.
 """
 
-# ==============================================================================
-# 1. GEOMETRIC PRIMITIVES: The Tensor Operators
-# ==============================================================================
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
+import matplotlib.pyplot as plt
+import math
 
+# --- 1. LOCKED PRIMITIVES ---
 class RoPE(nn.Module):
-    """
-    Rotary Positional Embeddings (The Conservative Force).
-    
-    PHYSICS:
-    Applies a unitary rotation matrix R(theta). Since R^T R = I, this transformation
-    is Isometric (Norm-Preserving). 
-    
-    INTERACTION:
-    It enforces rigid relative distance. On the diagonal (t=t), RoPE is Identity.
-    It anchors the manifold to the sequence grid, fighting the drift of the Wedge.
-    """
     def __init__(self, dim, max_len=2048):
         super().__init__()
         self.dim = dim
@@ -73,9 +66,7 @@ class RoPE(nn.Module):
         freqs = torch.einsum('i,j->ij', t, inv_freq)
         self.register_buffer('cos', freqs.cos())
         self.register_buffer('sin', freqs.sin())
-
     def forward(self, x):
-        # x: (B, H, T, D)
         seq_len = x.shape[2]
         cos = self.cos[:seq_len, :].unsqueeze(0).unsqueeze(0)
         sin = self.sin[:seq_len, :].unsqueeze(0).unsqueeze(0)
@@ -83,198 +74,169 @@ class RoPE(nn.Module):
         x2 = x[..., 1::2]
         return torch.cat((-x2 * sin + x1 * cos, x1 * sin + x2 * cos), dim=-1)
 
-
 class WedgeTransform(nn.Module):
-    """
-    The Symplectic Wedge (The Disruptive Force).
-    
-    PHYSICS:
-    Applies a skew-symmetric flow: v_new = v(I + S), where S = A - A^T.
-    This approximates a symplectic deformation, preserving phase-space volume but
-    twisting the manifold to bridge semantic gaps.
-    
-    INTERACTION:
-    - Diagonal (Self): <v, vS> = 0. The Wedge is invisible to the self. It cannot
-      corrupt Identity.
-    - Off-Diagonal (Relation): The Wedge activates, warping the space to allow
-      distant tokens to resonate despite RoPE's rigid distance cost.
-      
-    INITIALIZATION: "Silent Wedge" (Zeros).
-    We start in flat Euclidean space. The model learns to curve the universe
-    only where necessary. 
-    """
     def __init__(self, dim, heads):
         super().__init__()
         self.n_head = heads
         self.head_dim = dim // heads
-        # Silent Init: Start flat.
         self.A = nn.Parameter(torch.zeros(heads, self.head_dim, self.head_dim))
-        
     def forward(self, x):
-        # x: (B, H, T, D)
         B, H, T, Dh = x.shape
-        v = x.transpose(1, 2) # (B, T, H, D)
-        
-        # S is (H, D, D). Enforce Skew-Symmetry.
+        v = x.transpose(1, 2)
         S = self.A - self.A.transpose(-1, -2)
-        
-        # Apply Flow
-        flow = torch.matmul(v, S)
-        v_twisted = v + flow
-        return v_twisted.transpose(1, 2) # Back to (B, H, T, D)
-
-
-class _FusedLogSumExp4D(torch.autograd.Function):
-    """
-    The Numerical Guardian (Convex Softmax Kernel).
-    
-    PHYSICS:
-    Standard FP16 Softmax underflows for small probabilities (exp(-1000) -> 0).
-    This destroys gradients for "quiet" signals (Gradient Starvation).
-    We compute LogSumExp in Float32 to preserve the "Energy" of the distribution,
-    ensuring probability mass is neither created nor destroyed by precision errors.
-    """
-    @staticmethod
-    def forward(ctx, x: torch.Tensor):
-        m, _ = x.max(dim=-1, keepdim=True)           
-        y = x - m
-        ex = y.exp()
-        s = ex.sum(dim=-1, keepdim=True)
-        lse = m + s.log()
-        ctx.save_for_backward(ex, s)
-        return lse
-
-    @staticmethod
-    def backward(ctx, grad_output):
-        ex, s = ctx.saved_tensors
-        grad_x = grad_output * (ex / s)
-        return grad_x
+        v_twisted = v + torch.matmul(v, S)
+        return v_twisted.transpose(1, 2)
 
 class ConvexSoftmax(nn.Module):
     def forward(self, scores):
-        lse = _FusedLogSumExp4D.apply(scores)
-        log_weights = scores - lse
-        return torch.exp(log_weights)
+        m, _ = scores.max(dim=-1, keepdim=True)
+        y = scores - m
+        ex = y.exp()
+        lse = m + ex.sum(dim=-1, keepdim=True).log()
+        return torch.exp(scores - lse)
 
-# ==============================================================================
-# 2. THE ARCHITECTURE: Context-Pulse Attention
-# ==============================================================================
-
+# --- 2. THE CAUSAL CHUNKED MODEL ---
 class ContextPulseAttention(nn.Module):
-    def __init__(self, d_model, n_head):
+    def __init__(self, d_model, head_dim, chunk_size=16):
         super().__init__()
         self.d_model = d_model
-        self.n_head = n_head
-        self.head_dim = d_model // n_head
-        self.scale = self.head_dim ** -0.5
+        self.head_dim = head_dim
+        self.chunk_size = chunk_size
+        self.scale = head_dim ** -0.5
 
-        # --- PROJECTIONS ---
-        self.W_Q = nn.Linear(d_model, d_model, bias=False)
-        self.W_K = nn.Linear(d_model, d_model, bias=False)
-        self.W_V = nn.Linear(d_model, d_model, bias=False)
-        self.W_O = nn.Linear(d_model, d_model, bias=False)
+        self.W_Q = nn.Linear(d_model, head_dim, bias=False)
+        self.W_K = nn.Linear(d_model, head_dim, bias=False)
+        self.W_V = nn.Linear(d_model, head_dim, bias=False)
         
-        # --- ROLE-BASED INITIALIZATION (Geometric Priors) ---
-        # Q (Context): Orthogonal. The Vessel must be rigid to contain the sum.
         nn.init.orthogonal_(self.W_Q.weight)
-        # K (Pulse): Silent (Normal 0.02). The Event starts quiet to avoid flooding.
         nn.init.normal_(self.W_K.weight, mean=0.0, std=0.02)
-        # V (Value): Xavier. Standard signal transport.
         nn.init.xavier_normal_(self.W_V.weight)
 
-        # --- DYNAMIC GATING ---
-        # Controls the Leaky Integrator decay.
-        # Shared projection, but per-head decay parameter.
-        self.decay_logits = nn.Parameter(torch.zeros(1, n_head, 1, 1))
-        self.gate_proj = nn.Linear(d_model, d_model)
-
-        # --- GEOMETRIC STACK ---
-        self.rope = RoPE(self.head_dim)
-        self.wedge = WedgeTransform(self.head_dim, n_head) 
+        self.gate_proj = nn.Linear(d_model, head_dim)
+        self.rope = RoPE(head_dim)
+        self.wedge = WedgeTransform(head_dim, 1)
         self.softmax = ConvexSoftmax()
         
-        # --- THE TOILET (Entropy Management) ---
-        # 1. Scalar Sink: An isotropic energy floor. "If signal < threshold, dump here."
-        #    Per-head independence allows Head A to be strict and Head B lenient.
-        self.sink_scalar = nn.Parameter(torch.zeros(1, n_head, 1, 1))
-        
-        # 2. Learned Reset Value: The "I Don't Know" vector.
-        #    When the Sink activates, we output this bias instead of silence.
-        self.v_null = nn.Parameter(torch.zeros(1, n_head, 1, self.head_dim)) 
+        self.sink_scalar = nn.Parameter(torch.tensor(0.0))
+        self.v_null = nn.Parameter(torch.zeros(1, 1, 1, head_dim)) 
 
     def forward(self, x):
         B, T, C = x.shape
-        H, Dh = self.n_head, self.head_dim
+        H, Dh = 1, self.head_dim
         
-        # 1. Projections: (B, T, H, D) -> (B, H, T, D)
         q_raw = self.W_Q(x).view(B, T, H, Dh).transpose(1, 2)
         k_raw = self.W_K(x).view(B, T, H, Dh).transpose(1, 2)
-        v = self.W_V(x).view(B, T, H, Dh).transpose(1, 2)
-        
-        # 2. Gating: Input-Dependent Decay
+        v_val = self.W_V(x).view(B, T, H, Dh).transpose(1, 2)
         gate = torch.sigmoid(self.gate_proj(x)).view(B, T, H, Dh).transpose(1, 2)
-        decay = torch.sigmoid(self.decay_logits) # (1, H, 1, 1)
+
+        num_chunks = math.ceil(T / self.chunk_size)
+        Q_output_list = []
+        history_cache = [] 
         
-        # 3. THE INTEGRATION (Constructing the Manifold)
-        # Q becomes the accumulation of past K pulses.
-        # Causality is enforced by the loop structure, not a mask.
-        Q_context = torch.zeros_like(q_raw)
-        running_q = torch.zeros(B, H, Dh, device=x.device)
-        
-        for t in range(T):
-            # gate controls "how much pulse enters context"
-            input_t = gate[:, :, t, :] * q_raw[:, :, t, :]
-            # decay controls "how much history is retained"
-            running_q = decay[:, :, :, 0] * running_q + (1.0 - decay[:, :, :, 0]) * input_t
-            Q_context[:, :, t, :] = running_q
+        for i in range(num_chunks):
+            t_start = i * self.chunk_size
+            t_end = min((i + 1) * self.chunk_size, T)
+            
+            q_chunk = q_raw[:, :, t_start:t_end, :]
+            k_chunk = k_raw[:, :, t_start:t_end, :]
+            gate_chunk = gate[:, :, t_start:t_end, :]
+            
+            if len(history_cache) > 0:
+                history_stack = torch.cat(history_cache, dim=2)
+                resonance_scores = (k_chunk @ history_stack.transpose(-2, -1)) * self.scale
+                resonance_weights = F.softmax(resonance_scores, dim=-1)
+                q_retrieved = resonance_weights @ history_stack
+                base_state = history_cache[-1].expand(-1, -1, k_chunk.size(2), -1)
+                q_initial = base_state + q_retrieved
+            else:
+                q_initial = torch.zeros_like(k_chunk)
+
+            masked_input = gate_chunk * q_chunk
+            q_integrated = torch.cumsum(masked_input, dim=2)
+            q_chunk_out = q_integrated + q_initial
+            
+            Q_output_list.append(q_chunk_out)
+            final_state = q_chunk_out[:, :, -1:, :]
+            history_cache.append(final_state)
+            
+        Q_context = torch.cat(Q_output_list, dim=2)
         K_pulse = k_raw
         
-        # 4. SYMBIOTIC INSTANCE NORM (The Coupling Force)
-        # Forces Q and K to share energy statistics per-sample, per-head.
-        # Prevents "Ghost of Newton" optimization drift where Q >> K.
-        # Normalize over (Time, Dim) only. Keep Heads independent.
-        dims = (2, 3) 
-        mean_sym = 0.5 * (Q_context.mean(dim=dims, keepdim=True) + K_pulse.mean(dim=dims, keepdim=True))
-        std_sym = 0.5 * (Q_context.std(dim=dims, keepdim=True) + K_pulse.std(dim=dims, keepdim=True))
+        # --- POINTWISE SYMBIOTIC NORM (Dim=-1 only) ---
+        mean_q = Q_context.mean(dim=-1, keepdim=True)
+        std_q = Q_context.std(dim=-1, keepdim=True)
+        mean_k = K_pulse.mean(dim=-1, keepdim=True)
+        std_k = K_pulse.std(dim=-1, keepdim=True)
+        
+        mean_sym = 0.5 * (mean_q + mean_k)
+        std_sym = 0.5 * (std_q + std_k)
         
         Q_context = (Q_context - mean_sym) / (std_sym + 1e-6)
         K_pulse = (K_pulse - mean_sym) / (std_sym + 1e-6)
             
-        # 5. GEOMETRIC TWIST (Structure vs Flow)
-        # RoPE applies rigid rotation (Time-Encoding).
-        # Wedge applies symplectic twist (Semantic-Encoding).
         Q_geo = self.wedge(self.rope(Q_context))
         K_geo = self.wedge(self.rope(K_pulse))
         
-        # 6. RESONANCE (Attention Scores)
-        # Dot product measures geometric interference.
         Attn = (Q_geo @ K_geo.transpose(-2, -1)) * self.scale
-        
-        # Masking (Still needed to filter the "Future Pulse" noise, which is orthogonal but non-zero)
         mask = torch.triu(torch.ones(T, T, device=x.device), diagonal=1).bool()
         Attn.masked_fill_(mask, float('-inf'))
         
-        # 7. THE SINK (Entropy Floor)
-        # Inject scalar threshold. If Attn < SinkScalar, probability flows here.
-        # Expands to (B, H, T, 1). No rotation needed.
         null_scores = self.sink_scalar.expand(B, H, T, 1)
         Attn_full = torch.cat([Attn, null_scores], dim=-1)
-        
-        # 8. PROBABILITY MASS
         probs_full = self.softmax(Attn_full)
-        
-        # 9. VALUE INTEGRATION
-        # Standard weighted sum of history
-        probs_seq = probs_full[..., :T]
-        out = probs_seq @ v
-        
-        # 10. RESET MECHANISM
-        # If sink activated, add the learned "I Don't Know" vector.
-        # This is numerically safe because the scalar sink naturally regulates probability.
-        probs_sink = probs_full[..., T:] # (B, H, T, 1)
-        out = out + probs_sink * self.v_null
-        
-        # 11. OUTPUT
-        out = out.transpose(1, 2).contiguous().view(B, T, C)
-        return self.W_O(out)
-\
+        out = probs_full[..., :T] @ v_val + probs_full[..., T:] * self.v_null
+            
+        return out.transpose(1, 2).reshape(B, T, self.d_model)
+
+# --- 3. HARNESS ---
+class ToyTransformer(nn.Module):
+    def __init__(self, vocab_size, d_model):
+        super().__init__()
+        self.embed = nn.Embedding(vocab_size, d_model)
+        # Chunk size 8 for seq_len 64
+        self.attn = ContextPulseAttention(d_model, d_model, chunk_size=8)
+        self.fc = nn.Linear(d_model, vocab_size)
+    def forward(self, x):
+        h = self.embed(x)
+        h = self.attn(h)
+        return self.fc(h)
+
+def get_batch(batch_size=32, seq_len=64, vocab_size=128, device='cpu'):
+    data = torch.randint(0, vocab_size, (batch_size, seq_len), device=device)
+    half = seq_len // 2
+    data[:, half:] = data[:, :half] 
+    inputs = data[:, :-1]
+    targets = data[:, 1:]
+    return inputs, targets
+
+def run_simple():
+    print("--- SIMPLE TASK: Causal Chunked Context-Pulse ---")
+    VOCAB = 64
+    DIM = 32
+    STEPS = 500
+    LR = 3e-3
+    DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
+    
+    model = ToyTransformer(VOCAB, DIM).to(DEVICE)
+    opt = optim.AdamW(model.parameters(), lr=LR)
+    
+    loss_hist = []
+    for i in range(STEPS):
+        x, y = get_batch(seq_len=64, vocab_size=VOCAB, device=DEVICE)
+        opt.zero_grad()
+        logits = model(x)
+        loss = F.cross_entropy(logits.reshape(-1, VOCAB), y.reshape(-1))
+        loss.backward()
+        opt.step()
+        loss_hist.append(loss.item())
+
+    plt.figure(figsize=(10, 6))
+    plt.plot(loss_hist)
+    plt.title("Simple Recall: Causal & Chunked")
+    plt.xlabel("Steps")
+    plt.ylabel("Loss")
+    plt.grid(True, alpha=0.3)
+    plt.show()
+
+if __name__ == "__main__":
+    run_simple()
