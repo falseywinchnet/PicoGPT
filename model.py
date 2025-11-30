@@ -222,19 +222,7 @@ class Block(nn.Module):
 
     def forward(self, x):
         x = x + self.attn(self.ln_1(x))
-        residual = x
-        mlp_out = self.mlp(self.ln_2(x))
-        
-        # 1. Project MLP output onto Residual
-        res_norm_sq = (residual * residual).sum(dim=-1, keepdim=True) + 1e-6
-        overlap = (mlp_out * residual).sum(dim=-1, keepdim=True)
-        parallel = (overlap / res_norm_sq) * residual
-        
-        # 2. Isolate Tangent
-        mlp_tangent = mlp_out - parallel
-        
-        # 3. Update
-        x = x + mlp_tangent
+        x = x + self.mlp(self.ln_2(x))
         return x
 
 @dataclass
