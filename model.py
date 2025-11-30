@@ -9,7 +9,6 @@ from typing import Optional, Tuple, List
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import torch.utils.checkpoint as checkpoint
 
 class RoPE(nn.Module):
     """Rotary Positional Embeddings."""
@@ -31,6 +30,15 @@ class RoPE(nn.Module):
         x2 = x[..., 1::2]
         return torch.cat((-x2 * sin + x1 * cos, x1 * sin + x2 * cos), dim=-1)
 
+class ConvexSoftmax(nn.Module):
+    """Convex LSE (Float32 Precision)."""
+    def forward(self, scores):
+        m, _ = scores.max(dim=-1, keepdim=True)
+        y = scores - m
+        ex = y.exp()
+        lse = m + ex.sum(dim=-1, keepdim=True).log()
+        return torch.exp(scores - lse)
+
 class BiasedWedge(nn.Module):
     """
     Symplectic Geometry with an Escape Hatch.
@@ -49,19 +57,28 @@ class BiasedWedge(nn.Module):
 
     def forward(self, x):
         # x: (B, TotalHeads, T, D)
+        
+        # Construct S
         skew = self.A - self.A.transpose(-1, -2) # (D, D)
         diag = torch.diag_embed(self.id_bias)      # (H, D, D)
         S = skew + diag # Broadcasts to (H, D, D)
         
+        # Apply Flow: x @ S
+        # USE EINSUM TO PREVENT BROADCASTING ERRORS
+        # b: Batch
+        # h: TotalHeads (Matches S dim 0)
+        # t: Time (Ignored by S)
+        # d: Input Dim (Contracted)
+        # e: Output Dim
         flow = torch.einsum('bhtd,hde->bhte', x, S)
+        
         return x + flow
 
 class Attention(nn.Module):
-    def __init__(self, d_model, n_head, W_V):
+    def __init__(self, d_model, n_head,W_V):
         super().__init__()
         self.d_model = d_model
-
-        
+        self.W_V=W_V
         # System Hierarchy
         self.n_branches = n_head 
         self.head_dim = 64
@@ -76,9 +93,10 @@ class Attention(nn.Module):
         # --- 1. Projections ---
         self.W_K = nn.Linear(d_model, d_model, bias=True)
         self.W_Q_all = nn.Linear(d_model, d_model * self.n_branches, bias=False)
-        self.W_V = W_V
+        self.W_V = nn.Linear(d_model, d_model, bias=True)
 
         # --- 2. Geometry ---
+        # Ensure we use the BiasedWedge with einsum
         self.wedge = BiasedWedge(self.head_dim, self.n_total_heads)
         self.rope = RoPE(self.head_dim)
 
@@ -112,8 +130,9 @@ class Attention(nn.Module):
         v_base = self.W_V(x).view(B, T, N_sh, Dh).permute(0, 2, 1, 3)
         v = v_base.repeat(1, N_br, 1, 1)
 
-        # 2. Geometry 
+        # 2. Geometry
         q = self.wedge(q)
+        k = self.wedge(k)
         
         q = self.rope(q)
         k = self.rope(k)
@@ -127,60 +146,33 @@ class Attention(nn.Module):
         sinks = self.sink_scalars.view(1, H_tot, 1, 1).expand(B, -1, T, -1)
         attn_scores_full = torch.cat([attn_scores, sinks], dim=-1)
         probs_full = self.softmax(attn_scores_full)
-        
+
+        # 4. Value Aggregation
         probs_tokens = probs_full[..., :T]
         probs_sink   = probs_full[..., T:]
 
-        # 4. Value Aggregation (The Orthonormal Tangent Solver)
-        # We implement the geometrically validated "Steering" update.
-        # Instead of mixing (which conflates magnitude and direction), we calculate 
-        # the component of the target that is ORTHOGONAL to the current state.
-        # This allows the model to "slide" along the manifold surface (Simplex)
-        # without wasting energy on scaling or collapsing the structure.
-        
-        # A. The Raw Target (Standard Mix)
-        # Where the attention wants to pull us.
-        # target: (B, H, T, Dh)
-        target = probs_tokens @ v
+        out_tokens = probs_tokens @ v
 
-        # B. Gram-Schmidt Orthogonalization
-        # We project the Target onto the Current State (v) to find the "Parallel" component.
-        # Parallel = (Target . v) / (v . v) * v
-        # We use a small epsilon for numerical stability.
-        
-        # v_norm_sq: (B, H, T, 1) -> Magnitude of current features
-        v_norm_sq = (v * v).sum(dim=-1, keepdim=True) + 1e-6
-        
-        # overlap: (B, H, T, 1) -> How much is the target just "more of the same"?
-        overlap = (target * v).sum(dim=-1, keepdim=True)
-        
-        # parallel: (B, H, T, Dh) -> The scaling component
-        parallel = (overlap / v_norm_sq) * v
-        
-        # C. The Synthetic Tangent (Pure Rotation)
-        # We remove the scaling component to isolate the steering direction.
-        # 
-        synthetic_v = target - parallel
+        # Sinks (Reshape v_nulls to broadcast correctly)
+        # v_nulls: (Br, D) -> (Br*Sh, Dh) -> (1, H_tot, 1, Dh)
+        v_null_expanded = self.v_nulls.view(N_br * N_sh, Dh).view(1, H_tot, 1, Dh)
+        out_sinks = probs_sink * v_null_expanded
 
-        # D. Inertia Gating (Step Size)
-        # If the head attends to the sink, confidence is low.
-        # We scale the update magnitude by the participation factor.
-        participation = 1.0 - probs_sink
-        
-        context = participation * synthetic_v
+        context = out_tokens + out_sinks # (B, H_tot, T, Dh)
 
         # 5. Output
         # Recover Branch dim
         context = context.view(B, N_br, N_sh, T, Dh)
         context = context.permute(0, 1, 3, 2, 4).contiguous().view(B, N_br, T, C)
         
-        # Projection & Bias 
+        # Projection & Bias (Explicit broadcast fix for Bias)
         y_proj = torch.einsum('bntc,ncd->bntd', context, self.W_O_params)
         bias = self.W_O_bias.view(1, N_br, 1, C)
         
         y = y_proj + bias
 
         return y.mean(dim=1)
+
 
 class LayerNorm(nn.Module):
     def __init__(self, ndim: int, bias: bool = True):
@@ -212,51 +204,56 @@ class MLP(nn.Module):
         return x
 
 class Block(nn.Module):
-    def __init__(self, config, W_V):
+    def __init__(self, config,W_V):
         super().__init__()
         self.ln_1 = LayerNorm(config.n_embd, bias=config.bias)
-        self.attn = Attention(config.n_embd, config.n_head, W_V)
+        self.attn = Attention(config.n_embd,config.n_head,W_V)
         self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
         self.mlp = MLP(config)
 
-    def forward(self, x):
+    def forward(self,x):
         x = x + self.attn(self.ln_1(x))
         x = x + self.mlp(self.ln_2(x))
         return x
 
+import torch.utils.checkpoint as checkpoint # New: Required for activation checkpointing
 @dataclass
 class GPTConfig:
     block_size: int = 1024
-    vocab_size: int = 50304
+    vocab_size: int = 50304 # GPT-2 vocab_size of 50257, padded up to nearest multiple of 64 for efficiency
     n_layer: int = 12
     n_head: int = 12
     n_embd: int = 768
     dropout: float = 0.0
-    bias: bool = True
+    bias: bool = True # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
 
 class GPT(nn.Module):
+
     def __init__(self, config):
         super().__init__()
         assert config.vocab_size is not None
         assert config.block_size is not None
         self.config = config
-        
-        # W_V passed for compatibility, though internal Attention logic handles V
-        self.W_V = nn.Linear(config.n_embd, config.n_embd, bias=True)
+        self.W_V= nn.Linear(config.n_embd, config.n_embd, bias=True),
 
         self.transformer = nn.ModuleDict(dict(
             wte = nn.Embedding(config.vocab_size, config.n_embd),
             drop = nn.Dropout(config.dropout),
-            h = nn.ModuleList([Block(config, self.W_V) for _ in range(config.n_layer)]),
+            h = nn.ModuleList([Block(config,self.W_V) for _ in range(config.n_layer)]),
             ln_f = LayerNorm(config.n_embd, bias=config.bias),
         ))
 
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
-        self.transformer.wte.weight = self.lm_head.weight # Weight Tying
-
+        # report number of parameters
         print("number of parameters: %.2fM" % (self.get_num_params()/1e6,))
 
     def get_num_params(self, non_embedding=True):
+        """
+        Return the number of parameters in the model.
+        For non-embedding count (default), the position embeddings get subtracted.
+        The token embeddings would too, except due to the parameter sharing these
+        params are actually used as weights in the final layer, so we include them.
+        """
         n_params = sum(p.numel() for p in self.parameters())
         return n_params
 
@@ -264,17 +261,22 @@ class GPT(nn.Module):
         device = idx.device
         b, T = idx.size()
 
-        x = self.transformer.wte(idx) 
+        # forward the GPT model itself
+        x = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
         for block in self.transformer.h:
             x  = checkpoint.checkpoint(block, x, use_reentrant=False)
 
         x = self.transformer.ln_f(x)
 
         if targets is not None:
+            # if we are given some desired targets also calculate the loss
             logits = self.lm_head(x)
+
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
+
         else:
-            logits = self.lm_head(x[:, [-1], :])
+            # inference-time mini-optimization: only forward the lm_head on the very last position
+            logits = self.lm_head(x[:, [-1], :]) # note: using list [-1] to preserve the time dim
             loss = None
 
         return logits, loss
