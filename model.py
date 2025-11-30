@@ -114,7 +114,6 @@ class Attention(nn.Module):
 
         # 2. Geometry 
         q = self.wedge(q)
-        k = self.wedge(k)
         
         q = self.rope(q)
         k = self.rope(k)
