@@ -151,21 +151,38 @@ class Attention(nn.Module):
         probs_tokens = probs_full[..., :T]
         probs_sink   = probs_full[..., T:]
 
-        out_tokens = probs_tokens @ v
+       # A. Raw Pull (Weighted Target)
+        target = probs_tokens @ v
 
-        # Sinks (Reshape v_nulls to broadcast correctly)
-        # v_nulls: (Br, D) -> (Br*Sh, Dh) -> (1, H_tot, 1, Dh)
-        v_null_expanded = self.v_nulls.view(N_br * N_sh, Dh).view(1, H_tot, 1, Dh)
-        out_sinks = probs_sink * v_null_expanded
+        # B. Gram-Schmidt Orthogonalization
+        # Project Target onto Current State (v) to find Parallel component.
+        v_norm_sq = (v * v).sum(dim=-1, keepdim=True) + 1e-6
+        overlap = (target * v).sum(dim=-1, keepdim=True)
+        parallel = (overlap / v_norm_sq) * v
+        
+        # C. Orthogonal Component (Pure Steering)
+        ortho = target - parallel
+        
+        # D. Stability Brake (PID-like Damping)
+        # As alignment increases, we re-introduce the parallel component to dampen steering noise.
+        parallel_mag = parallel.norm(dim=-1, keepdim=True)
+        target_mag = target.norm(dim=-1, keepdim=True) + 1e-6
+        alignment = (parallel_mag / target_mag).clamp(0, 1)
+        brake = alignment.pow(2) 
+        
+        # E. Re-Integrate
+        # If brake=0 (Misaligned): out = ortho (Fast Steering)
+        # If brake=1 (Aligned):    out = ortho + parallel = target (Standard Stability)
+        synthetic_v = ortho + (brake * parallel)
 
-        context = out_tokens + out_sinks # (B, H_tot, T, Dh)
+        # F. Inertia Gating
+        participation = 1.0 - probs_sink
+        context = participation * synthetic_v
 
         # 5. Output
-        # Recover Branch dim
         context = context.view(B, N_br, N_sh, T, Dh)
         context = context.permute(0, 1, 3, 2, 4).contiguous().view(B, N_br, T, C)
         
-        # Projection & Bias (Explicit broadcast fix for Bias)
         y_proj = torch.einsum('bntc,ncd->bntd', context, self.W_O_params)
         bias = self.W_O_bias.view(1, N_br, 1, C)
         
