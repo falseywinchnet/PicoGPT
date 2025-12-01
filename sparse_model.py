@@ -280,23 +280,18 @@ class GPT(nn.Module):
         return logits, loss
 
         import torch
-import torch.nn as nn
-import torch.nn.functional as F
-from dataclasses import dataclass
-
-# --- Re-using Autograder's Geometry Classes ---
-# (RoPE, ConvexSoftmax, BiasedWedge are assumed to be defined as in the prompt)
 
 @dataclass
 class SSAConfig:
-    block_size: int = 16      # Token count per block
-    top_k: int = 8            # Number of blocks to retrieve
-    sink_size: int = 64       # Number of initial tokens to always attend to
-    alignment_alpha: float = 0.5 # Weight for alignment loss
+    # RENAMED: Distinct variable for the Sparse Chunk size
+    ssa_block_size: int = 16      
+    top_k: int = 8                
+    sink_size: int = 64           
+    alignment_alpha: float = 0.5  
     
-    # Inherited from GPTConfig
-    block_size: int = 1024
-    vocab_size: int = 50304 # GPT-2 vocab_size of 50257, padded up to nearest multiple of 64 for efficiency
+    # GPT Context parameters
+    block_size: int = 1024        
+    vocab_size: int = 50304 
     n_layer: int = 12
     n_head: int = 12
     n_embd: int = 768
@@ -336,7 +331,8 @@ class SSA_Attention(nn.Module):
         self.softmax = nn.Softmax(dim=-1)
         
         # --- 5. SSA Config ---
-        self.block_size = config.block_size
+        # CORRECTED: Use the distinct SSA block size variable
+        self.ssa_block_size = config.ssa_block_size 
         self.top_k = config.top_k
         self.sink_size = config.sink_size
 
@@ -392,8 +388,6 @@ class SSA_Attention(nn.Module):
 
         out_tokens = probs_tokens @ v
 
-        # FIX: Directly reshape v_nulls. 
-        # v_nulls is (N_br, D_model) -> (N_br, N_sh * Dh) -> (H_tot, Dh)
         v_null_expanded = self.v_nulls.view(1, H_tot, 1, Dh)
                           
         out_sinks = probs_sink * v_null_expanded
@@ -402,61 +396,92 @@ class SSA_Attention(nn.Module):
         return context
 
     def forward_sparse_logic(self, q, k, v, T):
-        B, H_tot, _, Dh = q.shape
-        num_blocks = T // self.block_size
+        """
+        SSA Logic applied to the TotalHeads.
+        Includes padding fix for inference robustness.
+        """
+        B, H_tot, T_orig, Dh = q.shape
+        
+        # --- 0. Pad to multiple of ssa_block_size ---
+        # Use the specific SSA block size for calculation
+        blk_sz = self.ssa_block_size
+        
+        pad_len = (blk_sz - (T_orig % blk_sz)) % blk_sz
+        
+        if pad_len > 0:
+            q_pad = F.pad(q, (0, 0, 0, pad_len))
+            k_pad = F.pad(k, (0, 0, 0, pad_len))
+        else:
+            q_pad, k_pad = q, k
+            
+        B, H, T_pad, _ = q_pad.shape
+        num_blocks = T_pad // blk_sz
         
         # 1. Pooling
-        k_blocked = k.view(B, H_tot, num_blocks, self.block_size, Dh)
+        k_blocked = k_pad.view(B, H_tot, num_blocks, blk_sz, Dh)
         k_means = k_blocked.mean(dim=3)
         
-        q_blocked = q.view(B, H_tot, num_blocks, self.block_size, Dh)
+        q_blocked = q_pad.view(B, H_tot, num_blocks, blk_sz, Dh)
         q_means = q_blocked.mean(dim=3)
         
         # 2. Scoring
         block_scores = (q_means @ k_means.transpose(-2, -1))
+        
         block_mask = torch.triu(torch.ones(num_blocks, num_blocks, device=q.device), diagonal=1).bool()
         block_scores.masked_fill_(block_mask, float('-inf'))
         
         # 3. Selection
-        # Handle cases where T is small (num_blocks < top_k)
         curr_k = min(self.top_k, num_blocks)
         if curr_k > 0:
             _, topk_indices = torch.topk(block_scores, k=curr_k, dim=-1)
-            
             keep_block_mask = torch.zeros(B, H_tot, num_blocks, num_blocks, device=q.device, dtype=torch.bool)
             keep_block_mask.scatter_(3, topk_indices, True)
             
-            token_mask = keep_block_mask.repeat_interleave(self.block_size, dim=2).repeat_interleave(self.block_size, dim=3)
+            # Upsample using blk_sz
+            token_mask = keep_block_mask.repeat_interleave(blk_sz, dim=2).repeat_interleave(blk_sz, dim=3)
         else:
-            # Fallback for very short sequences
-            token_mask = torch.zeros(B, H_tot, T, T, device=q.device, dtype=torch.bool)
+            # Fallback for empty/singularity
+            token_mask = torch.zeros(B, H_tot, T_pad, T_pad, device=q.device, dtype=torch.bool)
         
         # Sinks & Locals
         token_mask[..., :, :self.sink_size] = True
-        local_band = torch.ones(T, T, device=q.device).tril(0).triu(-self.block_size).bool()
-        token_mask = token_mask | local_band.view(1, 1, T, T)
+        local_band = torch.ones(T_pad, T_pad, device=q.device).tril(0).triu(-blk_sz).bool()
+        token_mask = token_mask | local_band.view(1, 1, T_pad, T_pad)
         
         # 4. Attention
-        scores = (q @ k.transpose(-2, -1)) * self.scale
-        causal_mask = torch.triu(torch.ones(T, T, device=q.device), diagonal=1).bool()
+        scores = (q_pad @ k_pad.transpose(-2, -1)) * self.scale
+        causal_mask = torch.triu(torch.ones(T_pad, T_pad, device=q.device), diagonal=1).bool()
         
         final_mask = causal_mask | (~token_mask)
+        
+        # Mask out padding columns if they exist
+        if pad_len > 0:
+            padding_mask = torch.zeros(T_pad, T_pad, device=q.device, dtype=torch.bool)
+            padding_mask[:, T_orig:] = True 
+            final_mask = final_mask | padding_mask
+
         scores.masked_fill_(final_mask, float('-inf'))
         
         # 5. Output with Sinks
-        sinks = self.sink_scalars.view(1, H_tot, 1, 1).expand(B, -1, T, -1)
+        sinks = self.sink_scalars.view(1, H_tot, 1, 1).expand(B, -1, T_pad, -1)
         scores_full = torch.cat([scores, sinks], dim=-1)
         probs_full = self.softmax(scores_full)
         
-        probs_tokens = probs_full[..., :T]
-        probs_sink   = probs_full[..., T:]
+        probs_tokens = probs_full[..., :T_pad]
+        probs_sink   = probs_full[..., T_pad:]
         
-        out_tokens = probs_tokens @ v
+        if pad_len > 0:
+            v_pad = F.pad(v, (0, 0, 0, pad_len))
+        else:
+            v_pad = v
+            
+        out_tokens = probs_tokens @ v_pad
         
-        # FIX: Same reshape logic as full logic
         v_null_expanded = self.v_nulls.view(1, H_tot, 1, Dh)
-                          
-        context = out_tokens + (probs_sink * v_null_expanded)
+        context_pad = out_tokens + (probs_sink * v_null_expanded)
+        
+        # Unpad
+        context = context_pad[..., :T_orig, :]
         return context
 
     def forward(self, x):
@@ -489,6 +514,7 @@ class SSA_Attention(nn.Module):
             y = self.project_output(context_main, B, T, C)
             
         return y.mean(dim=1), align_loss
+
 
 class SSA_Block(nn.Module):
     def __init__(self, config):
