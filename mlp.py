@@ -19,7 +19,7 @@ class MLP(nn.Module):
 
     def forward(self, x):
         x = self.c_fc(x)
-        x = x **2 + 0.5* x**3
+        x = x **2 + 0.75* x**3 #todo- determine if must be adjusted for hidden_dim size changes
         x = self.ln(x)
         x = x * torch.sigmoid(self.scale * x)
         x = self.c_proj(x)
