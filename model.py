@@ -264,11 +264,11 @@ class Block(nn.Module):
         half = C//2
         A = x[...,:half]
         B = x[...,half:]
-        A = A + self.left(self.ln_1(B),self.ln_2(A))
-        A = A + self.mlpa(self.ln_3(A))
+        B = B + self.left(self.ln_1(A),self.ln_2(B))
+        B = B + self.mlpa(self.ln_3(B))
 
-        B = B + self.right(self.ln_4(A),self.ln_5(B))
-        B = B + self.mlpb(self.ln_6(A))
+        A = A + self.right(self.ln_4(B),self.ln_5(A))
+        A = A + self.mlpb(self.ln_6(A))
 
         x = torch.cat([A,B],dim=-1)
 
