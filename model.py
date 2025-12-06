@@ -1,4 +1,4 @@
-    #copyright joshuah.rainstar@gmail.com 2025
+#copyright joshuah.rainstar@gmail.com 2025
 #MIT with attribution
 
 import math
@@ -48,21 +48,21 @@ class BiasedWedge(nn.Module):
         super().__init__()
         self.head_dim = head_dim
         self.total_heads = total_heads
-        
+
         # 1. Shared Skew (Global Twist): (D, D)
         self.A = nn.Parameter(torch.zeros(head_dim, head_dim))
-        
+
         # 2. Identity Bias (Local Preservation): (TotalHeads, D)
         self.id_bias = nn.Parameter(torch.zeros(total_heads, head_dim))
 
     def forward(self, x):
         # x: (B, TotalHeads, T, D)
-        
+
         # Construct S
         skew = self.A - self.A.transpose(-1, -2) # (D, D)
         diag = torch.diag_embed(self.id_bias)      # (H, D, D)
         S = skew + diag # Broadcasts to (H, D, D)
-        
+
         # Apply Flow: x @ S
         # USE EINSUM TO PREVENT BROADCASTING ERRORS
         # b: Batch
@@ -71,32 +71,30 @@ class BiasedWedge(nn.Module):
         # d: Input Dim (Contracted)
         # e: Output Dim
         flow = torch.einsum('bhtd,hde->bhte', x, S)
-        
+
         return x + flow
 
 class Attention(nn.Module):
-    def __init__(self, d_model, n_head,W_V):
+    def __init__(self, d_model, n_head, k_retrieval: int = 4):
         super().__init__()
         self.d_model = d_model
-        self.W_V=W_V
         # System Hierarchy
-        self.n_branches = n_head 
-        self.head_dim = 64
-        self.n_sub_heads = d_model // self.head_dim
-        assert d_model % self.head_dim == 0, "d_model must be divisible by head_dim"
-        
+        assert d_model % n_head == 0, "d_model must be divisible by n_heads"
+        self.n_sub_heads = n_head
+        self.n_branches = 4
+        self.head_dim = d_model//n_head
+
         # Unified Head Dimension
-        self.n_total_heads = self.n_branches * self.n_sub_heads
-        
+        self.n_total_heads = self.n_branches * n_head
+
         self.scale = self.head_dim ** -0.5
+        self.k_retrieval = k_retrieval
 
         # --- 1. Projections ---
         self.W_K = nn.Linear(d_model, d_model, bias=True)
         self.W_Q_all = nn.Linear(d_model, d_model * self.n_branches, bias=False)
-        self.W_V = nn.Linear(d_model, d_model, bias=True)
-
+  
         # --- 2. Geometry ---
-        # Ensure we use the BiasedWedge with einsum
         self.wedge = BiasedWedge(self.head_dim, self.n_total_heads)
         self.rope = RoPE(self.head_dim)
 
@@ -104,42 +102,48 @@ class Attention(nn.Module):
         self.sink_scalars = nn.Parameter(torch.zeros(self.n_total_heads, 1, 1))
         self.v_nulls = nn.Parameter(torch.zeros(self.n_branches, d_model))
 
-        # --- 4. Output ---
+        # --- 4. V network: maps marker (Dh) -> value (Dh)
+        # This takes the "marker" (superposition of K) and hallucinates the value
+        self.V_net = nn.Sequential(
+            nn.Linear(self.head_dim, 4 * self.head_dim),
+            nn.GELU(),
+            nn.Linear(4 * self.head_dim, self.head_dim),
+        )
+
+        # --- 5. Output ---
         self.W_O_params = nn.Parameter(torch.empty(self.n_branches, d_model, d_model))
         self.W_O_bias = nn.Parameter(torch.zeros(self.n_branches, d_model))
 
         nn.init.xavier_uniform_(self.W_O_params)
         self.softmax = nn.Softmax(dim=-1)
 
-    def forward(self, x):
-        B, T, C = x.shape
+    def forward(self, A,X):
+        B, T, C = A.shape
         H_tot = self.n_total_heads
         N_br = self.n_branches
         N_sh = self.n_sub_heads
         Dh = self.head_dim
-
+        K_top = min(self.k_retrieval, T)
         # 1. Projections
         # Q: (B, T, TotalHeads, Dh) -> (B, TotalHeads, T, Dh)
-        q = self.W_Q_all(x).view(B, T, H_tot, Dh).permute(0, 2, 1, 3)
+        q = self.W_Q_all(A).view(B, T, H_tot, Dh).permute(0, 2, 1, 3)
 
-        # K: (B, T, SubHeads, Dh) -> Expand to TotalHeads
-        k_base = self.W_K(x).view(B, T, N_sh, Dh).permute(0, 2, 1, 3)
-        k = k_base.repeat(1, N_br, 1, 1) 
+        # K: content-based key templates
+        k_base = self.W_K(X)
+        k_base_u = k_base.view(B, T, N_sh, Dh).permute(0, 2, 1, 3)
+        k = k_base_u.repeat(1, N_br, 1, 1) # (B, H_tot, T, Dh)
 
-        # V: Expand to TotalHeads
-        v_base = self.W_V(x).view(B, T, N_sh, Dh).permute(0, 2, 1, 3)
-        v = v_base.repeat(1, N_br, 1, 1)
-
-        # 2. Geometry
+        # 2. Geometry on Q, K
         q = self.wedge(q)
         k = self.wedge(k)
-        
+
         q = self.rope(q)
         k = self.rope(k)
 
-        # 3. Attention
+        # 3. Attention scores & mask
+        # attn_scores: (B, H_tot, T, T)
         attn_scores = (q @ k.transpose(-2, -1)) * self.scale
-        mask = torch.triu(torch.ones(T, T, device=x.device), diagonal=1).bool()
+        mask = torch.triu(torch.ones(T, T, device=A.device), diagonal=1).bool()
         attn_scores.masked_fill_(mask, float('-inf'))
 
         # Sinks
@@ -147,70 +151,59 @@ class Attention(nn.Module):
         attn_scores_full = torch.cat([attn_scores, sinks], dim=-1)
         probs_full = self.softmax(attn_scores_full)
 
-        # 4. Value Aggregation
-        probs_tokens = probs_full[..., :T]
-        probs_sink   = probs_full[..., T:]
+        # Split tokens vs sink mass
+        probs_tokens = probs_full[..., :T]   # (B, H_tot, T, T)
+        probs_sink   = probs_full[..., T:]   # (B, H_tot, T, 1)
 
-        
-        '''
-        #ORTHAGONALITY EXPERIMENT DONT USE YET
-       # A. Raw Pull (Weighted Target)
-        target = probs_tokens @ v
+        # 4. Build markers from K via top-K retrieval
+        # vals, idxs: (B, H_tot, T, K_top)
+        vals, idxs = probs_tokens.topk(K_top, dim=-1)
 
-        # B. Gram-Schmidt Orthogonalization
-        # Project Target onto Current State (v) to find Parallel component.
-        v_norm_sq = (v * v).sum(dim=-1, keepdim=True) + 1e-6
-        overlap = (target * v).sum(dim=-1, keepdim=True)
-        parallel = (overlap / v_norm_sq) * v
-        
-        # C. Orthogonal Component (Pure Steering)
-        ortho = target - parallel
-        
-        # D. Stability Brake (PID-like Damping)
-        # As alignment increases, we re-introduce the parallel component to dampen steering noise.
-        parallel_mag = parallel.norm(dim=-1, keepdim=True)
-        target_mag = target.norm(dim=-1, keepdim=True) + 1e-6
-        alignment = (parallel_mag / target_mag).clamp(0, 1)
-        brake = alignment.pow(2) 
-        
-        # E. Re-Integrate
-        # If brake=0 (Misaligned): out = ortho (Fast Steering)
-        # If brake=1 (Aligned):    out = ortho + parallel = target (Standard Stability)
-        synthetic_v = ortho + (brake * parallel)
+        # Normalized weights for the retrieved keys
+        weights = vals / (vals.sum(dim=-1, keepdim=True) + 1e-9)  # (B, H_tot, T, K_top)
 
-        # F. Inertia Gating
-        participation = 1.0 - probs_sink
-        context = participation * synthetic_v
-
-        # 5. Output
-        context = context.view(B, N_br, N_sh, T, Dh)
-        context = context.permute(0, 1, 3, 2, 4).contiguous().view(B, N_br, T, C)
+        # --- FIX: Flatten batch dims to perform gather safely ---
+        # k: (B, H_tot, T, Dh) -> (B*H_tot, T, Dh)
+        k_flat = k.contiguous().view(B * H_tot, T, Dh)
         
-        y_proj = torch.einsum('bntc,ncd->bntd', context, self.W_O_params)
-        bias = self.W_O_bias.view(1, N_br, 1, C)
+        # idxs: (B, H_tot, T, K_top) -> (B*H_tot, T*K_top)
+        # We flatten the query structure so we can just grab items from T
+        idxs_flat = idxs.contiguous().view(B * H_tot, T * K_top)
         
-        y = y_proj + bias
+        # Expand indices for the feature dimension
+        # (B*H_tot, T*K_top, Dh)
+        idxs_expanded = idxs_flat.unsqueeze(-1).expand(-1, -1, Dh)
+        
+        # Gather: (B*H_tot, T*K_top, Dh)
+        k_gathered_flat = k_flat.gather(dim=1, index=idxs_expanded)
+        
+        # Reshape back to structure: (B, H_tot, T, K_top, Dh)
+        k_selected = k_gathered_flat.view(B, H_tot, T, K_top, Dh)
+        
+        # Weighted sum: (B, H_tot, T, K_top, 1) * (B, H_tot, T, K_top, Dh) -> sum over K_top
+        marker = (weights.unsqueeze(-1) * k_selected).sum(dim=3) # (B, H_tot, T, Dh)
 
-        return y.mean(dim=1)
-        '''
-        out_tokens = probs_tokens @ v
+        # 5. Pass markers through V_net to get value vectors
+        # marker_flat: (B*H_tot*T, Dh)
+        marker_flat = marker.view(B * H_tot * T, Dh)
+        v_flat = self.V_net(marker_flat) # (B*H_tot*T, Dh)
+        out_tokens = v_flat.view(B, H_tot, T, Dh)
 
-        # Sinks (Reshape v_nulls to broadcast correctly)
+        # 6. Sink contribution
         # v_nulls: (Br, D) -> (Br*Sh, Dh) -> (1, H_tot, 1, Dh)
         v_null_expanded = self.v_nulls.view(N_br * N_sh, Dh).view(1, H_tot, 1, Dh)
         out_sinks = probs_sink * v_null_expanded
 
-        context = out_tokens + out_sinks # (B, H_tot, T, Dh)
+        context = out_tokens + out_sinks
 
-        # 5. Output
+        # 7. Output projection & Bias
         # Recover Branch dim
         context = context.view(B, N_br, N_sh, T, Dh)
         context = context.permute(0, 1, 3, 2, 4).contiguous().view(B, N_br, T, C)
-        
-        # Projection & Bias (Explicit broadcast fix for Bias)
+
         y_proj = torch.einsum('bntc,ncd->bntd', context, self.W_O_params)
         bias = self.W_O_bias.view(1, N_br, 1, C)
-        
+
         y = y_proj + bias
 
         return y.mean(dim=1)
@@ -229,36 +222,59 @@ class LayerNorm(nn.Module):
         b = self.bias if self.use_bias else None
         return F.layer_norm(x, self.weight.shape, self.weight, b, 1e-5)
 
+
+
 class MLP(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.c_fc    = nn.Linear( config.n_embd,4* config.n_embd, bias=config.bias)
         self.scale = math.pi / math.sqrt(3.0)
-
+        self.ln = LayerNorm(config.n_embd*4, bias=config.bias)
+        
         self.c_proj  = nn.Linear(4 * config.n_embd, config.n_embd, bias=config.bias)
         self.dropout = nn.Dropout(config.dropout)
 
     def forward(self, x):
         x = self.c_fc(x)
+        x = x**2 + 0.75*x**3
+        x = self.ln(x)
         x = x * torch.sigmoid(self.scale * x)
         x = self.c_proj(x)
         x = self.dropout(x)
         return x
 
 class Block(nn.Module):
-    def __init__(self, config,W_V):
+    def __init__(self, config):
         super().__init__()
         self.ln_1 = LayerNorm(config.n_embd, bias=config.bias)
-        self.attn = Attention(config.n_embd,config.n_head,W_V)
         self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
-        self.mlp = MLP(config)
+        self.ln_3 = LayerNorm(config.n_embd, bias=config.bias)
+        self.ln_4 = LayerNorm(config.n_embd, bias=config.bias)
+        self.ln_5 = LayerNorm(config.n_embd, bias=config.bias)
+        self.ln_6 = LayerNorm(config.n_embd, bias=config.bias)
+
+        self.left = Attention(config.n_embd,config.n_head)
+        self.right = Attention(config.n_embd,config.n_head)
+
+        self.mlpa = MLP(config)
+        self.mlpb = MLP(config)
 
     def forward(self,x):
-        x = x + self.attn(self.ln_1(x))
-        x = x + self.mlp(self.ln_2(x))
+        B, T, C = x.shape
+        half = C//2
+        A = x[...,:half]
+        B = x[...,half:]
+        A = A + self.left(self.ln_1(B),self.ln_2(A))
+        A = A + self.mlpa(self.ln_3(A))
+
+        B = B + self.right(self.ln_4(A),self.ln_5(B))
+        B = B + self.mlpb(self.ln_6(A))
+
+        x = torch.cat([A,B],dim=-1)
+
         return x
 
-import torch.utils.checkpoint as checkpoint # New: Required for activation checkpointing
+
 @dataclass
 class GPTConfig:
     block_size: int = 1024
@@ -276,14 +292,17 @@ class GPT(nn.Module):
         assert config.vocab_size is not None
         assert config.block_size is not None
         self.config = config
-        self.W_V= nn.Linear(config.n_embd, config.n_embd, bias=True),
+        # Base noise seed (learned) for map generation
 
         self.transformer = nn.ModuleDict(dict(
             wte = nn.Embedding(config.vocab_size, config.n_embd),
             drop = nn.Dropout(config.dropout),
-            h = nn.ModuleList([Block(config,self.W_V) for _ in range(config.n_layer)]),
+            h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
+            ln_q = LayerNorm(config.n_embd, bias=config.bias),
             ln_f = LayerNorm(config.n_embd, bias=config.bias),
         ))
+        self.synth = MLP(config)
+
 
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
         # report number of parameters
@@ -299,16 +318,22 @@ class GPT(nn.Module):
         n_params = sum(p.numel() for p in self.parameters())
         return n_params
 
+
     def forward(self, idx, targets=None):
         device = idx.device
         b, T = idx.size()
+        tok_emb = self.transformer.wte(idx)
+        q = self.transformer.ln_q(self.synth(torch.ones_like(tok_emb)))
+        x = torch.cat([tok_emb,q],dim=-1)
 
         # forward the GPT model itself
-        x = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
         for block in self.transformer.h:
-            x  = checkpoint.checkpoint(block, x, use_reentrant=False)
+            x  = block(x)
 
-        x = self.transformer.ln_f(x)
+        A = x[...,:self.config.n_embd]
+
+
+        x = self.transformer.ln_f(A)
 
         if targets is not None:
             # if we are given some desired targets also calculate the loss
