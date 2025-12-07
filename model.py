@@ -30,15 +30,6 @@ class RoPE(nn.Module):
         x2 = x[..., 1::2]
         return torch.cat((-x2 * sin + x1 * cos, x1 * sin + x2 * cos), dim=-1)
 
-class ConvexSoftmax(nn.Module):
-    """Softmax but in log space"""
-    def forward(self, scores):
-        m, _ = scores.max(dim=-1, keepdim=True)
-        y = scores - m
-        ex = y.exp()
-        lse = m + ex.sum(dim=-1, keepdim=True).log()
-        return torch.exp(scores - lse)
-
 class BiasedWedge(nn.Module):
     def __init__(self, head_dim, total_heads):
         super().__init__()
@@ -121,7 +112,7 @@ class Attention(nn.Module):
         self.W_O_bias = nn.Parameter(torch.zeros(self.n_branches, d_model))
 
         nn.init.xavier_uniform_(self.W_O_params)
-        self.softmax = ConvexSoftmax()
+        self.softmax = nn.Softmax(dim=-1)
 
     def forward(self, A, X):
         B, T, C = A.shape
