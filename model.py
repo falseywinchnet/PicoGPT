@@ -31,7 +31,7 @@ class RoPE(nn.Module):
         return torch.cat((-x2 * sin + x1 * cos, x1 * sin + x2 * cos), dim=-1)
 
 class ConvexSoftmax(nn.Module):
-    """Convex LSE (Float32 Precision)."""
+    """Softmax but in log space"""
     def forward(self, scores):
         m, _ = scores.max(dim=-1, keepdim=True)
         y = scores - m
@@ -40,10 +40,6 @@ class ConvexSoftmax(nn.Module):
         return torch.exp(scores - lse)
 
 class BiasedWedge(nn.Module):
-    """
-    Symplectic Geometry with an Escape Hatch.
-    S = (A - A^T) + D
-    """
     def __init__(self, head_dim, total_heads):
         super().__init__()
         self.head_dim = head_dim
@@ -74,6 +70,10 @@ class BiasedWedge(nn.Module):
 
         return x + flow
 
+def norm(x):
+    # Purely functional rmsnorm with no learnable params
+    return F.rms_norm(x, (x.size(-1),))
+
 class Attention(nn.Module):
     def __init__(self, d_model, n_head, k_retrieval: int = 12):
         super().__init__()
@@ -103,7 +103,7 @@ class Attention(nn.Module):
         self.v_nulls = nn.Parameter(torch.zeros(self.n_branches, d_model))
 
         # --- 4. V network: maps marker (Dh) -> value (Dh)
-        # This takes the "marker" (superposition of K) and hallucinates the value
+        # This takes the "marker" (hologram of K geometry) and locates the value
         self.V_net = nn.Sequential(
             nn.Linear(self.head_dim, 4 * self.head_dim),
             nn.GELU(),
@@ -127,7 +127,7 @@ class Attention(nn.Module):
         # 1. Projections
         # Q: (B, T, TotalHeads, Dh) -> (B, TotalHeads, T, Dh)
         q = self.W_Q_all(A).view(B, T, H_tot, Dh).permute(0, 2, 1, 3)
-
+        q = norm(q)
         # K: content-based key templates
         k_base = self.W_K(X)
         k_base_u = k_base.view(B, T, N_sh, Dh).permute(0, 2, 1, 3)
@@ -211,53 +211,26 @@ class Attention(nn.Module):
         return y.mean(dim=1)
 
 
-class LayerNorm(nn.Module):
-    def __init__(self, ndim: int, bias: bool = True):
-        super().__init__()
-        self.weight = nn.Parameter(torch.ones(ndim))
-        self.use_bias = bias
-        if bias:
-            self.bias = nn.Parameter(torch.zeros(ndim))
-        else:
-            self.register_parameter("bias", None)
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        b = self.bias if self.use_bias else None
-        return F.layer_norm(x, self.weight.shape, self.weight, b, 1e-5)
-
-
-
 class MLP(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.c_fc    = nn.Linear( config.n_embd,4* config.n_embd, bias=config.bias)
         self.scale = math.pi / math.sqrt(3.0)
-        self.ln = LayerNorm(config.n_embd*4, bias=config.bias)
-
         self.c_proj  = nn.Linear(4 * config.n_embd, config.n_embd, bias=config.bias)
-        self.dropout = nn.Dropout(config.dropout)
-
     def forward(self, x):
         x = self.c_fc(x)
         x = x**2 + 0.75*x**3
-        x = self.ln(x)
+        x = norm(x)
         x = x * torch.sigmoid(self.scale * x)
         x = self.c_proj(x)
-        x = self.dropout(x)
         return x
 
 class Block(nn.Module):
     def __init__(self, config):
         super().__init__()
-        self.ln_1 = LayerNorm(config.n_embd, bias=config.bias)
-        self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
-        self.ln_3 = LayerNorm(config.n_embd, bias=config.bias)
-        self.ln_4 = LayerNorm(config.n_embd, bias=config.bias)
-        self.ln_5 = LayerNorm(config.n_embd, bias=config.bias)
-        self.ln_6 = LayerNorm(config.n_embd, bias=config.bias)
 
         self.left = Attention(config.n_embd,config.n_head)
         self.right = Attention(config.n_embd,config.n_head)
-
         self.mlpa = MLP(config)
         self.mlpb = MLP(config)
 
@@ -266,11 +239,11 @@ class Block(nn.Module):
         half = C//2
         A = x[...,:half]
         B = x[...,half:]
-        B = B + self.left(self.ln_1(A),self.ln_2(B))
-        B = B + self.mlpa(self.ln_3(B))
+        B = B + self.left(norm(A),norm(B))
+        B = B + self.mlpa(norm(B))
 
-        A = A + self.right(self.ln_4(B),self.ln_5(A))
-        A = A + self.mlpb(self.ln_6(A))
+        A = A + self.right(norm(B),norm(A))
+        A = A + self.mlpb(norm(A))
 
         x = torch.cat([A,B],dim=-1)
         return x
@@ -283,8 +256,6 @@ class GPTConfig:
     n_layer: int = 12
     n_head: int = 12
     n_embd: int = 768
-    dropout: float = 0.0
-    bias: bool = True # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
 
 from torch.utils.checkpoint import checkpoint
 
@@ -299,25 +270,15 @@ class GPT(nn.Module):
 
         self.transformer = nn.ModuleDict(dict(
             wte = nn.Embedding(config.vocab_size, config.n_embd),
-            drop = nn.Dropout(config.dropout),
             h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
-            ln_q = LayerNorm(config.n_embd, bias=config.bias),
-            ln_f = LayerNorm(config.n_embd, bias=config.bias),
+            synth = MLP(config),
         ))
-        self.synth = MLP(config)
-
 
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
         # report number of parameters
         print("number of parameters: %.2fM" % (self.get_num_params()/1e6,))
 
     def get_num_params(self, non_embedding=True):
-        """
-        Return the number of parameters in the model.
-        For non-embedding count (default), the position embeddings get subtracted.
-        The token embeddings would too, except due to the parameter sharing these
-        params are actually used as weights in the final layer, so we include them.
-        """
         n_params = sum(p.numel() for p in self.parameters())
         return n_params
 
@@ -326,21 +287,19 @@ class GPT(nn.Module):
         device = idx.device
         b, T = idx.size()
         tok_emb = self.transformer.wte(idx)
-        q = self.transformer.ln_q(self.synth(torch.ones_like(tok_emb)))
+        q = self.transformer.ln_q(self.transformer.synth(torch.ones_like(tok_emb)))
         x = torch.cat([tok_emb,q],dim=-1)
 
         # forward the GPT model itself
         for block in self.transformer.h:
             x  = checkpoint(block, x, use_reentrant=False)
 
-
-        A = x[...,:self.config.n_embd]
-        x = self.transformer.ln_f(A)
+        #extract the origin shift
+        x = norm(x[...,:self.config.n_embd])
 
         if targets is not None:
             # if we are given some desired targets also calculate the loss
             logits = self.lm_head(x)
-
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
 
         else:
