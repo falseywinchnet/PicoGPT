@@ -58,14 +58,7 @@ class BiasedWedge(nn.Module):
         skew = self.A - self.A.transpose(-1, -2) # (D, D)
         diag = torch.diag_embed(self.id_bias)      # (H, D, D)
         S = skew + diag # Broadcasts to (H, D, D)
-
-        # Apply Flow: x @ S
-        # USE EINSUM TO PREVENT BROADCASTING ERRORS
-        # b: Batch
-        # h: TotalHeads (Matches S dim 0)
-        # t: Time (Ignored by S)
-        # d: Input Dim (Contracted)
-        # e: Output Dim
+        
         flow = torch.einsum('bhtd,hde->bhte', x, S)
 
         return x + flow
@@ -74,14 +67,31 @@ def norm(x):
     # Purely functional rmsnorm with no learnable params
     return F.rms_norm(x, (x.size(-1),))
 
-class Attention(nn.Module):
-    def __init__(self, d_model, n_head, k_retrieval: int = 12):
+class MLP(nn.Module):
+    def __init__(self, dim):
         super().__init__()
+        self.c_fc    = nn.Linear( dim,4* dim, bias=True)
+        #todo- ablate benefit of negative-only first layer bias constrained with sigmoid and -1
+        self.scale = math.pi / math.sqrt(3.0)
+        self.c_proj  = nn.Linear(4 * dim, dim, bias=True)
+    def forward(self, x):
+        x = self.c_fc(x)
+        x = x**2 + 0.75*x**3
+        x = norm(x)
+        x = x * torch.sigmoid(self.scale * x)
+        x = self.c_proj(x)
+        return x
+
+class Attention(nn.Module):
+    def __init__(self, d_model, n_head, k_retrieval: int = 12): 
+        super().__init__()
+        #todo- ablate larger k_retrieval(we know >4 is optimal) and add sparse attention with DSA scanner from deepseek and SSA full/sparse disciplining
+        #from "sparse sparse attention". 
         self.d_model = d_model
         # System Hierarchy
         assert d_model % n_head == 0, "d_model must be divisible by n_heads"
         self.n_sub_heads = n_head
-        self.n_branches = 4
+        self.n_branches = 4 #todo: validate higher branch counts in larger models. expensive to ablate
         self.head_dim = d_model//n_head
 
         # Unified Head Dimension
@@ -92,7 +102,7 @@ class Attention(nn.Module):
 
         # --- 1. Projections ---
         self.W_K = nn.Linear(d_model, d_model, bias=True)
-        self.W_Q_all = nn.Linear(d_model, d_model * self.n_branches, bias=False)
+        self.W_Q_all = nn.Linear(d_model, d_model * self.n_branches, bias=True)
 
         # --- 2. Geometry ---
         self.wedge = BiasedWedge(self.head_dim, self.n_total_heads)
@@ -104,18 +114,14 @@ class Attention(nn.Module):
 
         # --- 4. V network: maps marker (Dh) -> value (Dh)
         # This takes the "marker" (hologram of K geometry) and locates the value
-        self.V_net = nn.Sequential(
-            nn.Linear(self.head_dim, 4 * self.head_dim),
-            nn.GELU(),
-            nn.Linear(4 * self.head_dim, self.head_dim),
-        )
+        self.V_net = MLP(self.head_dim)
 
         # --- 5. Output ---
         self.W_O_params = nn.Parameter(torch.empty(self.n_branches, d_model, d_model))
         self.W_O_bias = nn.Parameter(torch.zeros(self.n_branches, d_model))
 
         nn.init.xavier_uniform_(self.W_O_params)
-        self.softmax = nn.Softmax(dim=-1)
+        self.softmax = ConvexSoftmax()
 
     def forward(self, A, X):
         B, T, C = A.shape
@@ -163,8 +169,6 @@ class Attention(nn.Module):
         # Normalized weights for the retrieved keys
         weights = vals / (vals.sum(dim=-1, keepdim=True) + 1e-9)  # (B, H_tot, T, K_top)
 
-        # --- FIX: Flatten batch dims to perform gather safely ---
-        #dont allow rope to influence outcomes
         # k: (B, H_tot, T, Dh) -> (B*H_tot, T, Dh)
         k_flat = k_vanilla.contiguous().view(B * H_tot, T, Dh)
 
@@ -210,29 +214,14 @@ class Attention(nn.Module):
 
         return y.mean(dim=1)
 
-
-class MLP(nn.Module):
-    def __init__(self, config):
-        super().__init__()
-        self.c_fc    = nn.Linear( config.n_embd,4* config.n_embd, bias=config.bias)
-        self.scale = math.pi / math.sqrt(3.0)
-        self.c_proj  = nn.Linear(4 * config.n_embd, config.n_embd, bias=config.bias)
-    def forward(self, x):
-        x = self.c_fc(x)
-        x = x**2 + 0.75*x**3
-        x = norm(x)
-        x = x * torch.sigmoid(self.scale * x)
-        x = self.c_proj(x)
-        return x
-
 class Block(nn.Module):
     def __init__(self, config):
         super().__init__()
 
         self.left = Attention(config.n_embd,config.n_head)
         self.right = Attention(config.n_embd,config.n_head)
-        self.mlpa = MLP(config)
-        self.mlpb = MLP(config)
+        self.mlpa = MLP(config.n_embd)
+        self.mlpb = MLP(config.n_embd)
 
     def forward(self,x):
         B, T, C = x.shape
@@ -252,10 +241,10 @@ class Block(nn.Module):
 @dataclass
 class GPTConfig:
     block_size: int = 1024
-    vocab_size: int = 50304 # GPT-2 vocab_size of 50257, padded up to nearest multiple of 64 for efficiency
-    n_layer: int = 12
-    n_head: int = 12
-    n_embd: int = 768
+    vocab_size: int = 66 # you must set this for your tokenizer
+    n_layer: int = 8 #12-24 for real models, but in practice only 8 is good in pytorch- TODO convert model to jax
+    n_head: int = 4 #you must set this to minimum of 64 embed per head- in practice more branches, fewer heads.
+    n_embd: int = 256 
 
 from torch.utils.checkpoint import checkpoint
 
@@ -269,7 +258,7 @@ class GPT(nn.Module):
         # Base noise seed (learned) for map generation
 
         self.transformer = nn.ModuleDict(dict(
-            wte = nn.Embedding(config.vocab_size, config.n_embd),
+            wte = nn.Embedding(config.vocab_size, config.n_embd), #todo- try fixed orthonormed geometric embeddings
             h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
             synth = MLP(config),
         ))
@@ -282,12 +271,11 @@ class GPT(nn.Module):
         n_params = sum(p.numel() for p in self.parameters())
         return n_params
 
-
     def forward(self, idx, targets=None):
         device = idx.device
         b, T = idx.size()
         tok_emb = self.transformer.wte(idx)
-        q = self.transformer.ln_q(self.transformer.synth(torch.ones_like(tok_emb)))
+        q = norm(self.transformer.synth(torch.ones_like(tok_emb)))
         x = torch.cat([tok_emb,q],dim=-1)
 
         # forward the GPT model itself
@@ -295,7 +283,7 @@ class GPT(nn.Module):
             x  = checkpoint(block, x, use_reentrant=False)
 
         #extract the origin shift
-        x = norm(x[...,:self.config.n_embd])
+        x = (x[...,:self.config.n_embd])
 
         if targets is not None:
             # if we are given some desired targets also calculate the loss
