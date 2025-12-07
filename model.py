@@ -260,7 +260,7 @@ class GPT(nn.Module):
         self.transformer = nn.ModuleDict(dict(
             wte = nn.Embedding(config.vocab_size, config.n_embd), #todo- try fixed orthonormed geometric embeddings
             h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
-            synth = MLP(config),
+            synth = MLP(config.n_embd),
         ))
 
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
