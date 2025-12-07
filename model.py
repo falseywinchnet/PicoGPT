@@ -75,7 +75,7 @@ class BiasedWedge(nn.Module):
         return x + flow
 
 class Attention(nn.Module):
-    def __init__(self, d_model, n_head, k_retrieval: int = 4):
+    def __init__(self, d_model, n_head, k_retrieval: int = 12):
         super().__init__()
         self.d_model = d_model
         # System Hierarchy
@@ -93,7 +93,7 @@ class Attention(nn.Module):
         # --- 1. Projections ---
         self.W_K = nn.Linear(d_model, d_model, bias=True)
         self.W_Q_all = nn.Linear(d_model, d_model * self.n_branches, bias=False)
-  
+
         # --- 2. Geometry ---
         self.wedge = BiasedWedge(self.head_dim, self.n_total_heads)
         self.rope = RoPE(self.head_dim)
@@ -117,7 +117,7 @@ class Attention(nn.Module):
         nn.init.xavier_uniform_(self.W_O_params)
         self.softmax = nn.Softmax(dim=-1)
 
-    def forward(self, A,X):
+    def forward(self, A, X):
         B, T, C = A.shape
         H_tot = self.n_total_heads
         N_br = self.n_branches
@@ -132,6 +132,7 @@ class Attention(nn.Module):
         k_base = self.W_K(X)
         k_base_u = k_base.view(B, T, N_sh, Dh).permute(0, 2, 1, 3)
         k = k_base_u.repeat(1, N_br, 1, 1) # (B, H_tot, T, Dh)
+        k_vanilla = k.clone()
 
         # 2. Geometry on Q, K
         q = self.wedge(q)
@@ -143,7 +144,7 @@ class Attention(nn.Module):
         # 3. Attention scores & mask
         # attn_scores: (B, H_tot, T, T)
         attn_scores = (q @ k.transpose(-2, -1)) * self.scale
-        mask = torch.triu(torch.ones(T, T, device=A.device), diagonal=1).bool()
+        mask = torch.triu(torch.ones(T, T, device=X.device), diagonal=1).bool()
         attn_scores.masked_fill_(mask, float('-inf'))
 
         # Sinks
@@ -163,23 +164,24 @@ class Attention(nn.Module):
         weights = vals / (vals.sum(dim=-1, keepdim=True) + 1e-9)  # (B, H_tot, T, K_top)
 
         # --- FIX: Flatten batch dims to perform gather safely ---
+        #dont allow rope to influence outcomes
         # k: (B, H_tot, T, Dh) -> (B*H_tot, T, Dh)
-        k_flat = k.contiguous().view(B * H_tot, T, Dh)
-        
+        k_flat = k_vanilla.contiguous().view(B * H_tot, T, Dh)
+
         # idxs: (B, H_tot, T, K_top) -> (B*H_tot, T*K_top)
         # We flatten the query structure so we can just grab items from T
         idxs_flat = idxs.contiguous().view(B * H_tot, T * K_top)
-        
+
         # Expand indices for the feature dimension
         # (B*H_tot, T*K_top, Dh)
         idxs_expanded = idxs_flat.unsqueeze(-1).expand(-1, -1, Dh)
-        
+
         # Gather: (B*H_tot, T*K_top, Dh)
         k_gathered_flat = k_flat.gather(dim=1, index=idxs_expanded)
-        
+
         # Reshape back to structure: (B, H_tot, T, K_top, Dh)
         k_selected = k_gathered_flat.view(B, H_tot, T, K_top, Dh)
-        
+
         # Weighted sum: (B, H_tot, T, K_top, 1) * (B, H_tot, T, K_top, Dh) -> sum over K_top
         marker = (weights.unsqueeze(-1) * k_selected).sum(dim=3) # (B, H_tot, T, Dh)
 
@@ -230,7 +232,7 @@ class MLP(nn.Module):
         self.c_fc    = nn.Linear( config.n_embd,4* config.n_embd, bias=config.bias)
         self.scale = math.pi / math.sqrt(3.0)
         self.ln = LayerNorm(config.n_embd*4, bias=config.bias)
-        
+
         self.c_proj  = nn.Linear(4 * config.n_embd, config.n_embd, bias=config.bias)
         self.dropout = nn.Dropout(config.dropout)
 
@@ -271,7 +273,6 @@ class Block(nn.Module):
         A = A + self.mlpb(self.ln_6(A))
 
         x = torch.cat([A,B],dim=-1)
-
         return x
 
 
@@ -284,6 +285,8 @@ class GPTConfig:
     n_embd: int = 768
     dropout: float = 0.0
     bias: bool = True # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
+
+from torch.utils.checkpoint import checkpoint
 
 class GPT(nn.Module):
 
@@ -328,11 +331,10 @@ class GPT(nn.Module):
 
         # forward the GPT model itself
         for block in self.transformer.h:
-            x  = block(x)
+            x  = checkpoint(block, x, use_reentrant=False)
+
 
         A = x[...,:self.config.n_embd]
-
-
         x = self.transformer.ln_f(A)
 
         if targets is not None:
