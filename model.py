@@ -123,11 +123,12 @@ class Attention(nn.Module):
         K_top = min(self.k_retrieval, T)
         # 1. Projections
         # Q: (B, T, TotalHeads, Dh) -> (B, TotalHeads, T, Dh)
-        q = self.W_Q_all(A).view(B, T, H_tot, Dh).permute(0, 2, 1, 3)
+        q = self.W_Q_all(A).view(B, T, H_tot, Dh).permute(0, 2, 1, 3).contiguous()
+    
         q = norm(q)
         # K: content-based key templates
         k_base = self.W_K(X)
-        k_base_u = k_base.view(B, T, N_sh, Dh).permute(0, 2, 1, 3)
+        k_base_u = k_base.view(B, T, N_sh, Dh).permute(0, 2, 1, 3).contiguous()
         k = k_base_u.repeat(1, N_br, 1, 1) # (B, H_tot, T, Dh)
         k_vanilla = k.clone()
 
