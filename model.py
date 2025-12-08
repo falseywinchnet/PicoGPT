@@ -154,38 +154,43 @@ class Attention(nn.Module):
         probs_tokens = probs_full[..., :T]   # (B, H_tot, T, T)
         probs_sink   = probs_full[..., T:]   # (B, H_tot, T, 1)
 
-        # 4. Build markers from K via top-K retrieval
-        # vals, idxs: (B, H_tot, T, K_top)
-        vals, idxs = probs_tokens.topk(K_top, dim=-1)
+        # 4. Top-K retrieval (by attention mass)
+        vals, idxs = probs_tokens.topk(K_top, dim=-1)              # (B, H_tot, T, K_top)
+        weights = vals / (vals.sum(dim=-1, keepdim=True) + 1e-9)   # (B, H_tot, T, K_top)
 
-        # Normalized weights for the retrieved keys
-        weights = vals / (vals.sum(dim=-1, keepdim=True) + 1e-9)  # (B, H_tot, T, K_top)
+        # Gather keys for these indices from k_vanilla (unsorted)
+        k_flat        = k_vanilla.contiguous().view(B * H_tot, T, Dh)   # (B*H_tot, T, Dh)
+        idxs_flat     = idxs.contiguous().view(B * H_tot, T * K_top)    # (B*H_tot, T*K_top)
+        idxs_expanded = idxs_flat.unsqueeze(-1).expand(-1, -1, Dh)      # (B*H_tot, T*K_top, Dh)
+        k_gathered_flat = k_flat.gather(dim=1, index=idxs_expanded)     # (B*H_tot, T*K_top, Dh)
+        k_selected    = k_gathered_flat.view(B, H_tot, T, K_top, Dh)    # (B,H_tot,T,K_top,Dh)
 
-        # k: (B, H_tot, T, Dh) -> (B*H_tot, T, Dh)
-        k_flat = k_vanilla.contiguous().view(B * H_tot, T, Dh)
+        # Chronological ordering of neighbors (by token index in T)
+        idxs_sorted, sort_order = idxs.sort(dim=-1)                     # (B,H_tot,T,K_top)
+        # sort weights to match time order
+        weights_sorted = torch.gather(weights, -1, sort_order)          # (B,H_tot,T,K_top)
 
-        # idxs: (B, H_tot, T, K_top) -> (B*H_tot, T*K_top)
-        # We flatten the query structure so we can just grab items from T
-        idxs_flat = idxs.contiguous().view(B * H_tot, T * K_top)
+        # gather keys according to chrono-sorted indices
+        idxs_sorted_flat     = idxs_sorted.contiguous().view(B * H_tot, T * K_top)
+        idxs_sorted_expanded = idxs_sorted_flat.unsqueeze(-1).expand(-1, -1, Dh)
+        k_gathered_sorted_flat = k_flat.gather(dim=1, index=idxs_sorted_expanded)
+        k_sorted = k_gathered_sorted_flat.view(B, H_tot, T, K_top, Dh)  # (B,H_tot,T,K_top,Dh)
 
-        # Expand indices for the feature dimension
-        # (B*H_tot, T*K_top, Dh)
-        idxs_expanded = idxs_flat.unsqueeze(-1).expand(-1, -1, Dh)
+        # apply weights to k_sorted: weighted K sequence (the "hologram")
+        k_sorted_weighted = weights_sorted.unsqueeze(-1) * k_sorted     # (B,H_tot,T,K_top,Dh)
 
-        # Gather: (B*H_tot, T*K_top, Dh)
-        k_gathered_flat = k_flat.gather(dim=1, index=idxs_expanded)
+        # self-token key (anchor) from K: unscaled
+        # k_vanilla is already (B, H_tot, T, Dh), each [b,h,t] is self row in K
+        anchor  = k_vanilla.unsqueeze(3)                                # (B,H_tot,T,1,Dh)
 
-        # Reshape back to structure: (B, H_tot, T, K_top, Dh)
-        k_selected = k_gathered_flat.view(B, H_tot, T, K_top, Dh)
+        # concatenated sequence: [weighted k_0..weighted k_{K-1}, self_key]
+        seq = torch.cat([k_sorted_weighted, anchor], dim=3)            # (B,H_tot,T,K_top+1,Dh)
+        marker = seq.mean(dim=3)                              # (B,H_tot,T,Dh)
 
-        # Weighted sum: (B, H_tot, T, K_top, 1) * (B, H_tot, T, K_top, Dh) -> sum over K_top
-        marker = (weights.unsqueeze(-1) * k_selected).sum(dim=3) # (B, H_tot, T, Dh)
-
-        # 5. Pass markers through V_net to get value vectors
-        # marker_flat: (B*H_tot*T, Dh)
+        # 5. Pass fingerprint markers through V_net to get per-head values
         marker_flat = marker.view(B * H_tot * T, Dh)
-        v_flat = self.V_net(marker_flat) # (B*H_tot*T, Dh)
-        out_tokens = v_flat.view(B, H_tot, T, Dh)
+        v_flat      = self.V_net(marker_flat)                          # (B*H_tot*T, Dh)
+        out_tokens  = v_flat.view(B, H_tot, T, Dh)
 
         # 6. Sink contribution
         # v_nulls: (Br, D) -> (Br*Sh, Dh) -> (1, H_tot, 1, Dh)
