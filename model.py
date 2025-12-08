@@ -1,6 +1,6 @@
 #copyright joshuah.rainstar@gmail.com 2025
 #MIT with attribution
-
+#https://www.youtube.com/watch?v=118vCHaIn3Y lets roll.
 import math
 import copy
 from dataclasses import dataclass
@@ -74,8 +74,10 @@ class MLP(nn.Module):
         return x
 
 class Attention(nn.Module):
-    def __init__(self, d_model, n_head, k_retrieval: int = 12): 
+    def __init__(self, d_model, n_head, role): 
         super().__init__()
+        self.role = role
+        k_retrieval = 12
         #todo- ablate larger k_retrieval(we know >4 is optimal) and add sparse attention with DSA scanner from deepseek and SSA full/sparse disciplining
         #from "sparse sparse attention". 
         self.d_model = d_model
@@ -114,7 +116,7 @@ class Attention(nn.Module):
         nn.init.xavier_uniform_(self.W_O_params)
         self.softmax = nn.Softmax(dim=-1)
 
-    def forward(self, A, X):
+    def decide(self, A, X):
         B, T, C = A.shape
         H_tot = self.n_total_heads
         N_br = self.n_branches
@@ -155,9 +157,11 @@ class Attention(nn.Module):
         probs_sink   = probs_full[..., T:]   # (B, H_tot, T, 1)
 
         # 4. Top-K retrieval (by attention mass)
-        vals, idxs = probs_tokens.topk(K_top, dim=-1)              # (B, H_tot, T, K_top)
-        weights = vals / (vals.sum(dim=-1, keepdim=True) + 1e-9)   # (B, H_tot, T, K_top)
-
+        # broadcast mask to (1,1,T,T)
+        mask = torch.triu(torch.ones(T, T, device=X.device), diagonal=1).bool()
+        probs_tokens = probs_tokens.masked_fill(mask, 0.0)
+        
+        weights, idxs = probs_tokens.topk(K_top, dim=-1) 
         # Gather keys for these indices from k_vanilla (unsorted)
         k_flat        = k_vanilla.contiguous().view(B * H_tot, T, Dh)   # (B*H_tot, T, Dh)
         idxs_flat     = idxs.contiguous().view(B * H_tot, T * K_top)    # (B*H_tot, T*K_top)
@@ -211,12 +215,122 @@ class Attention(nn.Module):
 
         return y.mean(dim=1)
 
-class Block(nn.Module):
-    def __init__(self, config):
-        super().__init__()
+    def investigate(self, A, X):
+        B, T, C = A.shape
+        H_tot = self.n_total_heads
+        N_br = self.n_branches
+        N_sh = self.n_sub_heads
+        Dh = self.head_dim
+        K_top = min(self.k_retrieval, T)
+        # 1. Projections
+        # Q: (B, T, TotalHeads, Dh) -> (B, TotalHeads, T, Dh)
+        q = self.W_Q_all(A).view(B, T, H_tot, Dh).permute(0, 2, 1, 3).contiguous()
+    
+        q = norm(q)
+        # K: content-based key templates
+        k_base = self.W_K(X)
+        k_base_u = k_base.view(B, T, N_sh, Dh).permute(0, 2, 1, 3).contiguous()
+        k = k_base_u.repeat(1, N_br, 1, 1) # (B, H_tot, T, Dh)
+        k_vanilla = k.clone()
 
-        self.left = Attention(config.n_embd,config.n_head)
-        self.right = Attention(config.n_embd,config.n_head)
+        # 2. Geometry on Q, K
+        q = self.wedge(q)
+        k = self.wedge(k)
+
+        q = self.rope(q)
+        k = self.rope(k)
+
+        # 3. Calibrated absolute scores (no softmax, no sink)
+        # raw scores s_{t j} = <q_t, k_j>/sqrt(Dh)
+        attn_scores = torch.matmul(q, k.transpose(-2, -1)) * self.scale  # (B,H_tot,T,T)
+
+        # key self-scores c_j = <k_j, k_j>/sqrt(Dh) as per-key reference
+        key_self = (k * k).abs().sum(dim=-1) * self.scale       # (B,H_tot,T)
+        denom = key_self.unsqueeze(-2).clamp_min(1e-6)    # (B,H_tot,1,T)
+
+        # normalized scores (ratio wrt each key's self-score)
+        weights_full = attn_scores / denom               # (B,H_tot,T,T)
+
+        weights_full = weights_full * F.sigmoid(self.scale*norm(weights_full)) #logistic scaling
+        weights_full = F.softplus(weights_full) #soft clamp the floor to discourage neg results
+        mask = torch.triu(torch.ones(T, T, device=X.device), diagonal=1).bool()
+        weights_full = weights_full.masked_fill(mask, 0.0)
+        weights, idxs = weights_full.topk(K_top, dim=-1)     # (B,H_tot,T,K_top)
+
+        # Gather keys for these indices from k_vanilla (unsorted)
+        k_flat        = k_vanilla.contiguous().view(B * H_tot, T, Dh)   # (B*H_tot, T, Dh)
+        idxs_flat     = idxs.contiguous().view(B * H_tot, T * K_top)    # (B*H_tot, T*K_top)
+        idxs_expanded = idxs_flat.unsqueeze(-1).expand(-1, -1, Dh)      # (B*H_tot, T*K_top, Dh)
+        k_gathered_flat = k_flat.gather(dim=1, index=idxs_expanded)     # (B*H_tot, T*K_top, Dh)
+        k_selected    = k_gathered_flat.view(B, H_tot, T, K_top, Dh)    # (B,H_tot,T,K_top,Dh)
+
+        # Chronological ordering of neighbors (by token index in T)
+        idxs_sorted, sort_order = idxs.sort(dim=-1)                     # (B,H_tot,T,K_top)
+        # sort weights to match time order
+        weights_sorted = torch.gather(weights, -1, sort_order)          # (B,H_tot,T,K_top)
+
+        # gather keys according to chrono-sorted indices
+        idxs_sorted_flat     = idxs_sorted.contiguous().view(B * H_tot, T * K_top)
+        idxs_sorted_expanded = idxs_sorted_flat.unsqueeze(-1).expand(-1, -1, Dh)
+        k_gathered_sorted_flat = k_flat.gather(dim=1, index=idxs_sorted_expanded)
+        k_sorted = k_gathered_sorted_flat.view(B, H_tot, T, K_top, Dh)  # (B,H_tot,T,K_top,Dh)
+
+        # apply weights to k_sorted: weighted K sequence (the "hologram")
+        #this is OBLIGATED because some of the positions WILL be in the future for some rows
+        #and we want their contributions set to ZERO to ensure no future bleeding
+        #caveat- we could early in training randomly add a tiny bit of positive weight to randomly chosen
+        #nearby future positions
+        #entirely at random! just to help it pick up neighborhood information.
+        
+        k_sorted_weighted = weights_sorted.unsqueeze(-1) * k_sorted     # (B,H_tot,T,K_top,Dh)
+        
+        # self-token key (anchor) from K: unscaled
+        # k_vanilla is already (B, H_tot, T, Dh), each [b,h,t] is self row in K
+        anchor  = k_vanilla.unsqueeze(3)                                # (B,H_tot,T,1,Dh)
+
+        # concatenated sequence: [weighted k_0..weighted k_{K-1}, self_key]
+        seq = torch.cat([k_sorted_weighted, anchor], dim=3)            # (B,H_tot,T,K_top+1,Dh)
+        marker = seq.mean(dim=3)                              # (B,H_tot,T,Dh)
+
+        # 5. Pass fingerprint markers through V_net to get per-head values
+        marker_flat = marker.view(B * H_tot * T, Dh)
+        v_flat      = self.V_net(marker_flat)                          # (B*H_tot*T, Dh)
+        out_tokens  = v_flat.view(B, H_tot, T, Dh)
+        context = out_tokens 
+
+        # 7. Output projection & Bias
+        # Recover Branch dim
+        context = context.view(B, N_br, N_sh, T, Dh)
+        context = context.permute(0, 1, 3, 2, 4).contiguous().view(B, N_br, T, C)
+
+        y_proj = torch.einsum('bntc,ncd->bntd', context, self.W_O_params)
+        bias = self.W_O_bias.view(1, N_br, 1, C)
+
+        y = y_proj + bias
+
+        return y.mean(dim=1)
+
+    def forward(self, A, X):
+        if self.role == "ruthless":
+            return self.decide(A, X)
+            #eliminiate uncertainty, ambiguity. force a choice.
+        elif self.role == "careful":
+            return self.investigate(A, X)
+            #explore uncertainty, ambiguity. Allow non-commital thinking.
+
+
+class Block(nn.Module):
+    def __init__(self, config,var):
+        super().__init__()
+        if var % 2:
+            ar = "ruthless"
+            en = "careful"
+        else:
+            ar = "careful"
+            en = "ruthless"
+
+        self.architect = Attention(config.n_embd,config.n_head,ar)
+        self.engineer = Attention(config.n_embd,config.n_head, en)
         self.mlpa = MLP(config.n_embd)
         self.mlpb = MLP(config.n_embd)
 
@@ -225,10 +339,10 @@ class Block(nn.Module):
         half = C//2
         A = x[...,:half]
         B = x[...,half:]
-        B = B + self.left(norm(A),norm(B))
+        B = B + self.architect(norm(A),norm(B))
         B = B + self.mlpa(norm(B))
 
-        A = A + self.right(norm(B),norm(A))
+        A = A + self.engineer(norm(B),norm(A))
         A = A + self.mlpb(norm(A))
 
         x = torch.cat([A,B],dim=-1)
@@ -256,7 +370,7 @@ class GPT(nn.Module):
 
         self.transformer = nn.ModuleDict(dict(
             wte = nn.Embedding(config.vocab_size, config.n_embd), #todo- try fixed orthonormed geometric embeddings
-            h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
+            h = nn.ModuleList([Block(config,i) for i in range(config.n_layer)]),
             synth = MLP(config.n_embd),
         ))
 
