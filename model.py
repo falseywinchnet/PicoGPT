@@ -1,6 +1,6 @@
 #copyright joshuah.rainstar@gmail.com 2025
 #MIT with attribution
-#https://www.youtube.com/watch?v=118vCHaIn3Y lets roll.
+
 import math
 import copy
 from dataclasses import dataclass
@@ -89,8 +89,9 @@ class Attention(nn.Module):
 
         # Unified Head Dimension
         self.n_total_heads = self.n_branches * n_head
+        self.scale = math.pi / math.sqrt(3.0)
 
-        self.scale = self.head_dim ** -0.5
+        self.attnscale = self.head_dim ** -0.5
         self.k_retrieval = k_retrieval
 
         # --- 1. Projections ---
@@ -143,7 +144,7 @@ class Attention(nn.Module):
 
         # 3. Attention scores & mask
         # attn_scores: (B, H_tot, T, T)
-        attn_scores = (q @ k.transpose(-2, -1)) * self.scale
+        attn_scores = (q @ k.transpose(-2, -1)) * self.attnscale
         mask = torch.triu(torch.ones(T, T, device=X.device), diagonal=1).bool()
         attn_scores.masked_fill_(mask, float('-inf'))
 
