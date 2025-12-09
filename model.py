@@ -323,12 +323,9 @@ class Attention(nn.Module):
 class Block(nn.Module):
     def __init__(self, config,var):
         super().__init__()
-        if var % 2:
-            ar = "ruthless"
-            en = "careful"
-        else:
-            ar = "careful"
-            en = "ruthless"
+       
+        ar = "careful"
+        en = "careful"
 
         self.architect = Attention(config.n_embd,config.n_head,ar)
         self.engineer = Attention(config.n_embd,config.n_head, en)
