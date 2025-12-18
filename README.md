@@ -1,7 +1,8 @@
-#: we present our own alternative to softmax attention.
-#: we independently derive and implemented some mechanisms later discussed in FLASH MULTI-HEAD FEED-FORWARD NETWORK
-#: we produced our own MLP customization wih a nonlinearity that boosts performance.
-#: we collected papers and ideas and concepts here.
+# > An Epistemic Generative Pretrained Transformer Framework.
+we present a far better and more disciplined alternative to softmax attention.
+we independently derive and implement some mechanisms later discussed in FLASH MULTI-HEAD FEED-FORWARD NETWORK
+we produced our own MLP customization wih a nonlinearity that boosts performance.
+we collected papers and ideas and concepts here.
 
 Some facts you may wish to observe:
 
@@ -49,7 +50,7 @@ If preceded by a polynomial control field, such as x² + α x³, the module beco
 	•	linear reprojection
 This is consistent with controlled differential equation discretization, an explicit vector field update interpretation.
 
-#-
+# Dedication
 This repository is a goldmine to completely rework your epistemic depth on large language models.
 We explain all of our efforts as being only possible for the glory and grace of god,
 and we dedicate them in the name of christ, our heavenly king and savior, to the public domain.
