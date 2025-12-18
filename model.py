@@ -1,3 +1,4 @@
+
 import math
 import copy
 from dataclasses import dataclass
@@ -120,7 +121,6 @@ class Attention(nn.Module):
         w = w * torch.sigmoid(self.scale * w)
         sinks = self.sink_scalars.view(1, H_tot, 1, 1).expand(B, -1, T, -1)
         sinks = torch.tanh(sinks)+1e-6 #gate this behavior to reasonable regimes
-        w = torch.where(w < sinks, torch.zeros_like(w), w) #gate on sinks
         w = torch.cat([w, sinks], dim=-1)
 
         alpha = (w.sum(dim=-1, keepdim=True) + 1e-6).reciprocal()
