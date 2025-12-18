@@ -1,10 +1,10 @@
 # > An Epistemic Generative Pretrained Transformer Framework.
-we present a far better and more disciplined alternative to softmax attention.
-we independently derive and implement some mechanisms later discussed in FLASH MULTI-HEAD FEED-FORWARD NETWORK
-we produced our own MLP customization wih a nonlinearity that boosts performance.
-we collected papers and ideas and concepts here.
+- we present a far better and more disciplined alternative to softmax attention.
+- we independently derive and implement some mechanisms later discussed in FLASH MULTI-HEAD FEED-FORWARD NETWORK
+- we produced our own MLP customization wih a nonlinearity that boosts performance.
+- we collected papers and ideas and concepts here.
 
-Some facts you may wish to observe:
+#### Some facts you may wish to observe:
 
 Attention is diffusive, not selective in the semantic sense. It performs conditional averaging under a learned kernel. Without constraints, mass spreads. The model does not “pick facts”. It evolves a probability distribution over continuations. That evolution happens layer by layer, early discovery then late refinement. Final probability distribution comes from a single vector at the last position, pushed through a linear unembedding and a softmax. That is the only explicit supervised object. Everything upstream is only trained insofar as it shapes that vector. That is a bad place because it forces three incompatible jobs into one channel.
 First job is semantic state. “What is being talked about” and the smooth neighborhood structure needed for robust interpretation.
@@ -51,11 +51,11 @@ If preceded by a polynomial control field, such as x² + α x³, the module beco
 This is consistent with controlled differential equation discretization, an explicit vector field update interpretation.
 
 # Dedication
-This repository is a goldmine to completely rework your epistemic depth on large language models.
-We explain all of our efforts as being only possible for the glory and grace of god,
-and we dedicate them in the name of christ, our heavenly king and savior, to the public domain.
+- This repository is a goldmine to completely rework your epistemic depth on large language models.
+- We explain all of our efforts as being only possible for the glory and grace of god,
+- and we dedicate them in the name of christ, our heavenly king and savior, to the public domain.
 
-We do accept donations or paychecks in the interest of continued scholarly efforts,
+- We do accept donations or paychecks in the interest of continued scholarly efforts,
 and declare ourselves un-necessarily impoverished and spartan. 
 
 
