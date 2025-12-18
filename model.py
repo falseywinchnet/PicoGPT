@@ -7,97 +7,27 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-class PhaseVectorImprovedPositional(nn.Module):
-    def __init__(self, dim, max_deg=None):
+
+class RoPE(nn.Module):
+    """Rotary Positional Embeddings."""
+    def __init__(self, dim, max_len=4096):
         super().__init__()
-        assert dim % 2 == 0
         self.dim = dim
-        self.max_deg = max_deg  # max Chebyshev degree; if None, set from dim
-
-    def forward(self, q, k):
-        B, Heads, T, D = q.shape
-        device = q.device
-        dtype = q.dtype
-        H = D // 2
-
-        # Choose max_deg if not provided: a bit larger than number of pairs
-        max_deg = self.max_deg
-        if max_deg is None:
-            max_deg = max(3, 2 * H)  # e.g. up to degree 2H
-
-        # Normalized time u in [0,1], then x in [-1,1]
-        if T > 1:
-            u = torch.arange(T, device=device, dtype=dtype) / (T - 1)
-            x = 2.0 * u - 1.0   # (T,)
-        else:
-            x = torch.zeros(1, device=device, dtype=dtype)  # degenerate case
-
-        # Precompute Chebyshev polynomials T_n(x) for n = 0..max_deg
-        # Shape: (T, max_deg+1)
-        T_all = torch.empty(T, max_deg + 1, device=device, dtype=dtype)
-        T_all[:, 0] = 1.0
-        if max_deg >= 1:
-            T_all[:, 1] = x
-        for d in range(2, max_deg + 1):
-            T_all[:, d] = 2.0 * x * T_all[:, d - 1] - T_all[:, d - 2]
-
-        # Map feature pairs to degrees n_f in [1, max_deg-1]
-        if H > 1:
-            f_idx = torch.arange(H, device=device, dtype=dtype)
-            frac = f_idx / (H - 1)  # 0..1 across pairs
-        else:
-            frac = torch.zeros(1, device=device, dtype=dtype)
-
-        # Spread degrees roughly across the available range
-        n_f = 1 + (frac * (max_deg - 2)).round().to(torch.long)  # (H,)
-        n_f = torch.clamp(n_f, 1, max_deg - 1)
-        n_f_plus = n_f + 1  # still <= max_deg
-
-        # Gather raw1 = T_{n_f}(x), raw2 = T_{n_f+1}(x)
-        # T_all: (T, max_deg+1), n_f: (H,)
-        raw1 = T_all[:, n_f]       # (T, H)
-        raw2 = T_all[:, n_f_plus]  # (T, H)
-
-        # Normalize to get orientation vectors on the unit circle
-        norm = torch.sqrt(raw1 * raw1 + raw2 * raw2 + 1e-8)  # (T,H)
-        base1 = (raw1 / norm).unsqueeze(0).unsqueeze(0)  # (1,1,T,H)
-        base2 = (raw2 / norm).unsqueeze(0).unsqueeze(0)  # (1,1,T,H)
-
-        def apply_rot(x_in):
-            x1, x2 = x_in[..., :H], x_in[..., H:]
-            xr1 = x1 * base1 - x2 * base2
-            xr2 = x1 * base2 + x2 * base1
-            return torch.cat([xr1, xr2], dim=-1)
-
-        q_def = apply_rot(q)
-        k_def = apply_rot(k)
-        return q_def, k_def
-
-        
-class BiasedWedge(nn.Module):
-    def __init__(self, head_dim, total_heads):
-        super().__init__()
-        self.head_dim = head_dim
-        self.total_heads = total_heads
-
-        # 1. Shared Skew (Global Twist): (D, D)
-        self.A = nn.Parameter(torch.zeros(head_dim, head_dim))
-
-        # 2. Identity Bias (Local Preservation): (TotalHeads, D)
-        self.id_bias = nn.Parameter(torch.zeros(total_heads, head_dim))
+        inv_freq = 1.0 / (10000 ** (torch.arange(0, dim, 2).float() / dim))
+        t = torch.arange(max_len).float()
+        freqs = torch.einsum('i,j->ij', t, inv_freq)
+        self.register_buffer('cos', freqs.cos())
+        self.register_buffer('sin', freqs.sin())
 
     def forward(self, x):
-        # x: (B, TotalHeads, T, D)
-
-        # Construct S
-        skew = self.A - self.A.transpose(-1, -2) # (D, D)
-        diag = torch.diag_embed(self.id_bias)      # (H, D, D)
-        S = skew + diag # Broadcasts to (H, D, D)
+        # x: (B, H, T, D)
+        seq_len = x.shape[2]
+        cos = self.cos[:seq_len, :].unsqueeze(0).unsqueeze(0)
+        sin = self.sin[:seq_len, :].unsqueeze(0).unsqueeze(0)
+        x1 = x[..., 0::2]
+        x2 = x[..., 1::2]
+        return torch.cat((-x2 * sin + x1 * cos, x1 * sin + x2 * cos), dim=-1)
         
-        flow = torch.einsum('bhtd,hde->bhte', x, S)
-
-        return x + flow
-
 def norm(x):
     # Purely functional rmsnorm with no learnable params
     return F.rms_norm(x, (x.size(-1),))
@@ -140,9 +70,7 @@ class Attention(nn.Module):
 
         self.W_Q_all = nn.Linear(d_model, d_model * self.n_branches, bias=True)
 
-        # --- 2. Geometry ---
-        self.wedge = BiasedWedge(self.head_dim, self.n_total_heads)
-        self.rope = PhaseVectorImprovedPositional(self.head_dim)
+        self.rope = RoPE(self.head_dim)
 
         # --- 3. Sink Parameters ---
         self.sink_scalars = nn.Parameter(torch.zeros(self.n_total_heads, 1, 1))
@@ -174,14 +102,9 @@ class Attention(nn.Module):
         k_base = self.W_K(X)
         k_base_u = k_base.view(B, T, N_sh, Dh).permute(0, 2, 1, 3).contiguous()
         k = k_base_u.repeat(1, N_br, 1, 1) # (B, H_tot, T, Dh)
-        k_vanilla = k.clone()
-
-        # 2. Geometry on Q
-        q = self.wedge(q)
         # 3. PosEMB on both
-        q , k= self.rope(q,k)
-
-
+        q = self.rope(q)
+        k = self.rope(k)
 
         scores = (q @ k.transpose(-2, -1)) * self.attnscale
         key_self = (k * k).sum(dim=-1).clamp_min(1e-6)      # (B,T) = ||k_j||^2
@@ -196,7 +119,7 @@ class Attention(nn.Module):
 
         w = w * torch.sigmoid(self.scale * w)
         sinks = self.sink_scalars.view(1, H_tot, 1, 1).expand(B, -1, T, -1)
-
+        w = torch.where(w < sinks, torch.zeros_like(w), w) #gate on sinks
         w = torch.cat([w, sinks], dim=-1)
 
         alpha = (w.sum(dim=-1, keepdim=True) + 1e-6).reciprocal()
