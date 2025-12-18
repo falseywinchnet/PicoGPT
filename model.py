@@ -1,4 +1,3 @@
-
 import math
 import copy
 from dataclasses import dataclass
@@ -67,7 +66,7 @@ class Attention(nn.Module):
 
         # --- 1. Projections ---
         self.W_K = nn.Linear(d_model, d_model, bias=True)
-        self.W_V = nn.Linear(d_model, d_model, bias=True)
+        self.W_V_all = nn.Linear(d_model, d_model * self.n_branches, bias=True)
 
         self.W_Q_all = nn.Linear(d_model, d_model * self.n_branches, bias=True)
 
@@ -77,15 +76,8 @@ class Attention(nn.Module):
         self.sink_scalars = nn.Parameter(torch.zeros(self.n_total_heads, 1, 1))
         self.v_nulls = nn.Parameter(torch.zeros(self.n_total_heads, self.head_dim))
 
-        # --- 4. V network: maps marker (Dh) -> value (Dh)
-        # This takes the "marker" (hologram of K geometry) and locates the value
-
         # --- 5. Output ---
-        self.W_O_params = nn.Parameter(torch.empty(self.n_branches, d_model, d_model))
-        self.W_O_bias = nn.Parameter(torch.zeros(self.n_branches, d_model))
-
-        nn.init.xavier_uniform_(self.W_O_params)
-        self.softmax = nn.Softmax(dim=-1)
+        self.W_O = nn.Linear(d_model, d_model, bias=True)
 
     def forward(self, X):
         B, T, C = X.shape
@@ -97,8 +89,7 @@ class Attention(nn.Module):
         # Q: (B, T, TotalHeads, Dh) -> (B, TotalHeads, T, Dh)
         q = self.W_Q_all(X).view(B, T, H_tot, Dh).permute(0, 2, 1, 3).contiguous()
         # V: Expand to TotalHeads
-        v_base = self.W_V(X).view(B, T, N_sh, Dh).permute(0, 2, 1, 3)
-        v = v_base.repeat(1, N_br, 1, 1)
+        v = self.W_V_all(X).view(B, T, H_tot, Dh).permute(0, 2, 1, 3).contiguous()
         
         k_base = self.W_K(X)
         k_base_u = k_base.view(B, T, N_sh, Dh).permute(0, 2, 1, 3).contiguous()
@@ -121,6 +112,7 @@ class Attention(nn.Module):
         w = w * torch.sigmoid(self.scale * w)
         sinks = self.sink_scalars.view(1, H_tot, 1, 1).expand(B, -1, T, -1)
         sinks = torch.tanh(sinks)+1e-6 #gate this behavior to reasonable regimes
+        #w = torch.where(w < sinks, torch.zeros_like(w), w) #gate on sinks
         w = torch.cat([w, sinks], dim=-1)
 
         alpha = (w.sum(dim=-1, keepdim=True) + 1e-6).reciprocal()
@@ -131,24 +123,22 @@ class Attention(nn.Module):
         probs_sink   = probs_full[..., T:]   # (B, H_tot, T, 1)
         out_tokens = probs_tokens @ v
 
-        # Sinks (Reshape v_nulls to broadcast correctly)
-        # v_nulls: (Br, D) -> (Br*Sh, Dh) -> (1, H_tot, 1, Dh)
         v_null_expanded = self.v_nulls.view(1, H_tot, 1, Dh)
         out_sinks = probs_sink * v_null_expanded
 
         context = out_tokens + out_sinks # (B, H_tot, T, Dh)
 
-        # 5. Output
-        # Recover Branch dim
+        # Recover branch structure
         context = context.view(B, N_br, N_sh, T, Dh)
-        context = context.permute(0, 1, 3, 2, 4).contiguous().view(B, N_br, T, C)
+        context = context.permute(0, 1, 3, 2, 4).contiguous()  # (B, N_br, T, N_sh, Dh)
+        context = context.view(B, N_br, T, C)                 # (B, N_br, T, C)
         
-        # Projection & Bias (Explicit broadcast fix for Bias)
-        y_proj = torch.einsum('bntc,ncd->bntd', context, self.W_O_params)
-        bias = self.W_O_bias.view(1, N_br, 1, C)
+        # Apply shared output projection across branches
+        context_flat = context.view(B * N_br * T, C)
+        y_flat = self.W_O(context_flat)
+        y = y_flat.view(B, N_br, T, C)
         
-        y = y_proj + bias
-
+        # Branch aggregation
         return y.mean(dim=1)
 
 class Block(nn.Module):
