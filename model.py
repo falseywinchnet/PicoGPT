@@ -74,7 +74,7 @@ class Attention(nn.Module):
 
         # --- 3. Sink Parameters ---
         self.sink_scalars = nn.Parameter(torch.zeros(self.n_total_heads, 1, 1))
-        self.v_nulls = nn.Parameter(torch.zeros(self.n_branches, d_model))
+        self.v_nulls = nn.Parameter(torch.zeros(self.n_total_heads, self.head_dim))
 
         # --- 4. V network: maps marker (Dh) -> value (Dh)
         # This takes the "marker" (hologram of K geometry) and locates the value
@@ -133,7 +133,7 @@ class Attention(nn.Module):
 
         # Sinks (Reshape v_nulls to broadcast correctly)
         # v_nulls: (Br, D) -> (Br*Sh, Dh) -> (1, H_tot, 1, Dh)
-        v_null_expanded = self.v_nulls.view(N_br * N_sh, Dh).view(1, H_tot, 1, Dh)
+        v_null_expanded = self.v_nulls.view(1, H_tot, 1, Dh)
         out_sinks = probs_sink * v_null_expanded
 
         context = out_tokens + out_sinks # (B, H_tot, T, Dh)
