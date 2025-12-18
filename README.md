@@ -38,16 +38,18 @@ Diffusion-like behavior is emergent from repeated conditional averaging and trai
 Progressive refinement requires coarse-to-fine disambiguation with reversible early commitments and evidence accumulation.
 High-dimensional embedding width increases bifurcation capacity and dot-score separability but risks meaning dilution and hinge overload.
 Efficient decomposition of raw geometry into actionable low-rank structure is the main computational bottleneck for richer representations.
-Logistic CDE style gating: what it is, and what it is not
-Status quo premise
+
+
+### Logistic CDE style gating: what it is, and what it is not
+-  Status quo premise:
 Pick among ReLU, GELU, SiLU, based on benchmark folklore.
-Mechanistic replacement
-A gate of the form x ↦ x * sigmoid(c * x), with c chosen as π / √3, can be interpreted as a calibrated logistic CDF driven update that matches a Gaussian related scaling. It behaves like a small integrator step for a nonlinear drift rather than a generic hinge.
-If preceded by a polynomial control field, such as x² + α x³, the module becomes:
-	•	linear coordinates
-	•	control field shaping
-	•	logistic flow step
-	•	linear reprojection
+- Mechanistic replacement
+A gate of the form x ↦ x * sigmoid(c * x), with c chosen as π / √3, can be interpreted as a calibrated logistic CDF driven update that matches a Gaussian related scaling. It behaves like a small integrator step for a nonlinear drift rather than a generic hinge. It is superior to most if not all other gates. 
+-  If preceded by a polynomial control field, such as  x ↦ x² + α x³, the module becomes:
+•	linear coordinates
+•	control field shaping
+•	logistic flow step
+•	linear reprojection
 This is consistent with controlled differential equation discretization, an explicit vector field update interpretation.
 
 # Dedication
