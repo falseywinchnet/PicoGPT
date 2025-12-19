@@ -33,12 +33,12 @@ def norm(x):
     return F.rms_norm(x, (x.size(-1),))
 
 class MLP(nn.Module):
-    def __init__(self, dim):
+    def __init__(self, din,latent,out):
         super().__init__()
-        self.c_fc    = nn.Linear( dim,4* dim, bias=True)
+        self.c_fc    = nn.Linear( din,latent, bias=True)
         #todo- ablate benefit of negative-only first layer bias constrained with sigmoid and -1
         self.scale = math.pi / math.sqrt(3.0)
-        self.c_proj  = nn.Linear(4 * dim, dim, bias=True)
+        self.c_proj  = nn.Linear(latent, out, bias=True)
     def forward(self, x):
         x = self.c_fc(x)
         x = x**2 + 0.7049*x**3
@@ -66,9 +66,8 @@ class Attention(nn.Module):
 
         # --- 1. Projections ---
         self.W_K = nn.Linear(d_model, d_model, bias=True)
-        self.W_V_all = nn.Linear(d_model, d_model * self.n_branches, bias=True)
-
-        self.W_Q_all = nn.Linear(d_model, d_model * self.n_branches, bias=True)
+        self.W_V_all = nn.Linear(d_model, self.head_dim * self.n_total_heads, bias=True)
+        self.W_Q_all = nn.Linear(d_model, self.head_dim * self.n_total_heads, bias=True)
 
         self.rope = RoPE(self.head_dim)
 
@@ -77,7 +76,7 @@ class Attention(nn.Module):
         self.v_nulls = nn.Parameter(torch.zeros(self.n_total_heads, self.head_dim))
 
         # --- 5. Output ---
-        self.W_O = nn.Linear(d_model, d_model, bias=True)
+        self.W_O = nn.Linear(d_model, d_model)
 
     def forward(self, X):
         B, T, C = X.shape
@@ -134,6 +133,7 @@ class Attention(nn.Module):
         
         # Apply shared output projection across branches
         context_flat = context.view(B * N_br * T, C)
+        context_flat = context_flat * torch.sigmoid(self.scale * context_flat)
         y_flat = self.W_O(context_flat)
         y = y_flat.view(B, N_br, T, C)
         
@@ -145,7 +145,7 @@ class Block(nn.Module):
         super().__init__()
        
         self.attn = Attention(config.n_embd,config.n_head)
-        self.mlp = MLP(config.n_embd)
+        self.mlp = MLP(config.n_embd,config.n_embd*2,config.n_embd)
 
     def forward(self,x):
         B, T, C = x.shape
@@ -176,7 +176,6 @@ class GPT(nn.Module):
         self.transformer = nn.ModuleDict(dict(
             wte = nn.Embedding(config.vocab_size, config.n_embd), #todo- try fixed orthonormed geometric embeddings
             h = nn.ModuleList([Block(config,i) for i in range(config.n_layer)]),
-            synth = MLP(config.n_embd),
         ))
 
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
