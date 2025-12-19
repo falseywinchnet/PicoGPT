@@ -133,7 +133,6 @@ class Attention(nn.Module):
         
         # Apply shared output projection across branches
         context_flat = context.view(B * N_br * T, C)
-        context_flat = context_flat * torch.sigmoid(self.scale * context_flat)
         y_flat = self.W_O(context_flat)
         y = y_flat.view(B, N_br, T, C)
         
