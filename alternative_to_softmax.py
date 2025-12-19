@@ -11,6 +11,33 @@ alpha = (w.sum(dim=-1, keepdim=True) + 1e-8).reciprocal()
 attn_weights = w * alpha
 out_tokens = attn_weights @ v
 '''
+Let a row use a_j = f(z_j) / sum_k f(z_k), with f(z) = softplus(z) sigmoid(c softplus(z)).
+
+For large positive z, f is approximately linear, f(z) ≈ z. In that regime:
+
+Global upward drift flattens
+If every z_j increases by about the same amount c, 
+then weights become proportional to z_j + c, 
+and the added c increases the denominator by about T c. 
+Relative differences shrink, so attention becomes less peaky. 
+That is negative feedback against “inflate everything.”
+
+Mild growth avoids runaway peaking
+Because f grows roughly linearly rather than exponentially, 
+increasing the spread of z does not produce the same winner take all 
+collapse as softmax. The q scaling tests show exactly that, 
+10x to 100x barely changes top1 for custom, while softmax collapses.
+
+Key norm cancellation removes the incentive to “cheat” by blowing up key norms
+z uses k direction only. So one common failure mode in softmax, 
+inflate key norms to sharpen, is not available. 
+The key scaling invariance tests confirm this.
+
+So yes, there is a stabilizing loop: scale inflation pushes into a regime 
+where additional inflation yields diminishing selectivity gains, 
+and baseline inflation can even reduce selectivity.
+
+
 Softmax attention, for a single head and one query position i:
 Scores: s_ij = (q_i dot k_j) / sqrt(d)
 Weights: a_ij = exp(s_ij) / sum_j exp(s_ij)
