@@ -39,38 +39,69 @@ class MLP(nn.Module):
         #todo- ablate benefit of negative-only first layer bias constrained with sigmoid and -1
         self.scale = math.pi / math.sqrt(3.0)
         self.c_proj  = nn.Linear(latent, out, bias=True)
+        self.constant =  nn.Parameter(torch.ones(1))
     def forward(self, x):
         x = self.c_fc(x)
-        x = x**2 + 0.7049*x**3
+        x = x**2 + x.sign() #MLP boost
         x = x * torch.sigmoid(self.scale * x)
         x = self.c_proj(x)
         return x
 
+class KMax(nn.Module):
+    def __init__(self, head_dim: int, eps: float = 1e-8):
+        super().__init__()
+        self.head_dim = head_dim
+        self.eps = eps
+        self.scale = math.pi / math.sqrt(3.0)
+        self.softmax = nn.Softmax(dim=-1)
+    def forward(self, q: torch.Tensor, k: torch.Tensor, sinks: torch.Tensor, mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+        # q, k: (B, H, T, D)
+        scores = q @ k.transpose(-2, -1) # (B, H, T, T)
+        key_self = (k * k).sum(dim=-1)      # (B,T) = ||k_j||^2
+        denom = key_self.unsqueeze(-2).sqrt()    # (B,1,T) = ||k_j||
+        w = scores / denom
+        w = torch.tril(w)
+        # Apply branch-specific sliding window mask if provided
+        if mask is not None:
+            # mask is (1, H, T, T) or broadcastable
+            w = w * mask
+        w = torch.cat([w, sinks], dim=-1) # Append sink column
+        probs_full = self.softmax(w)
+        return probs_full
+
 class Attention(nn.Module):
     def __init__(self, d_model, n_head): 
         super().__init__()
-        #todo- ablate larger k_retrieval(we know >4 is optimal) and add sparse attention with DSA scanner from deepseek and SSA full/sparse disciplining
-        #from "sparse sparse attention". 
         self.d_model = d_model
-        # System Hierarchy
         assert d_model % n_head == 0, "d_model must be divisible by n_heads"
         self.n_sub_heads = n_head
-        self.n_branches = 4 #todo: validate higher branch counts in larger models. expensive to ablate
+        self.n_branches = 4 
         self.head_dim = d_model//n_head
 
         # Unified Head Dimension
         self.n_total_heads = self.n_branches * n_head
-        self.scale = math.pi / math.sqrt(3.0)
-
-        self.attnscale = self.head_dim ** -0.5
+        
+        # --- Branch Configuration ---
+        # Branch 0: Horizon 16, Gap 0
+        # Branch 1: Horizon 128, Gap 16 (excludes last 16)
+        # Branch 2: Horizon 128, Gap 0
+        # Branch 3: Horizon 512, Gap 144 (excludes last 128+16)
+        
+        # We store these as tensors for easy access. 
+        # Format: (Horizon, Gap)
+        self.branch_configs = [
+            (16, 0),    # Branch 0
+            (128, 16),  # Branch 1
+            (128, 0),   # Branch 2
+            (512, 144)  # Branch 3
+        ]
 
         # --- 1. Projections ---
         self.W_K = nn.Linear(d_model, d_model, bias=True)
         self.W_V_all = nn.Linear(d_model, self.head_dim * self.n_total_heads, bias=True)
         self.W_Q_all = nn.Linear(d_model, self.head_dim * self.n_total_heads, bias=True)
-
         self.rope = RoPE(self.head_dim)
-
+        self.softmax = KMax(self.head_dim)
         # --- 3. Sink Parameters ---
         self.sink_scalars = nn.Parameter(torch.zeros(self.n_total_heads, 1, 1))
         self.v_nulls = nn.Parameter(torch.zeros(self.n_total_heads, self.head_dim))
@@ -84,43 +115,52 @@ class Attention(nn.Module):
         N_br = self.n_branches
         N_sh = self.n_sub_heads
         Dh = self.head_dim
-        # 1. Projections
-        # Q: (B, T, TotalHeads, Dh) -> (B, TotalHeads, T, Dh)
-        q = self.W_Q_all(X).view(B, T, H_tot, Dh).permute(0, 2, 1, 3).contiguous()
-        # V: Expand to TotalHeads
-        v = self.W_V_all(X).view(B, T, H_tot, Dh).permute(0, 2, 1, 3).contiguous()
         
-        k_base = self.W_K(X)
-        k_base_u = k_base.view(B, T, N_sh, Dh).permute(0, 2, 1, 3).contiguous()
-        k = k_base_u.repeat(1, N_br, 1, 1) # (B, H_tot, T, Dh)
-        # 3. PosEMB on both
+        # 1. Projections
+        # Q,V: (B, T, TotalHeads, Dh) -> (B, TotalHeads, T, Dh)
+        q = self.W_Q_all(X).view(B, T, H_tot, Dh).permute(0, 2, 1, 3).contiguous()
+        q = norm(q) #You can norm Q. Not K. 
+
+        v = self.W_V_all(X).view(B, T, H_tot, Dh).permute(0, 2, 1, 3).contiguous()
+        k_base_u = self.W_K(X).view(B, T, N_sh, Dh).permute(0, 2, 1, 3).contiguous()
+        k_base_u = self.rope(k_base_u)
         q = self.rope(q)
-        k = self.rope(k)
+        k = k_base_u.repeat(1, N_br, 1, 1) # (B, H_tot, T, Dh)
 
-        scores = (q @ k.transpose(-2, -1)) * self.attnscale
-        key_self = (k * k).sum(dim=-1).clamp_min(1e-6)      # (B,T) = ||k_j||^2
-        denom = key_self.unsqueeze(-2).sqrt()               # (B,1,T) = ||k_j||
-        w = scores / denom
-
-        # kernel weights then row-normalize
-        w = F.softplus(w)                             # >= 0, softplus(-inf)=0
-        mask = torch.triu(torch.ones(T, T, device=X.device), diagonal=1).bool()
-
-        w = w.masked_fill(mask, float("0.0"))
-
-        w = w * torch.sigmoid(self.scale * w)
+        # --- Generate Branch-Specific Sliding Masks ---
+        # Create distance matrix (T, T)
+        # idx[i] - idx[j] gives distance. We want causal distance.
+        indices = torch.arange(T, device=X.device)
+        dist = indices.unsqueeze(1) - indices.unsqueeze(0) # (T, T). dist[i,j] = i-j
+        
+        # Build mask for each branch
+        # Shape: (N_br, T, T)
+        branch_masks = []
+        for (horizon, gap) in self.branch_configs:
+            # Condition: gap <= distance < horizon
+            # We also ensure distance >= 0 (causality), though KMax tril handles the strict upper triangle.
+            # Using 1.0 for valid, 0.0 for invalid
+            m = ((dist >= gap) & (dist < horizon)).float()
+            branch_masks.append(m)
+            
+        branch_masks = torch.stack(branch_masks, dim=0) # (N_br, T, T)
+        
+        # Expand mask to cover all sub-heads within a branch
+        # We need shape (1, H_tot, T, T) to broadcast over Batch
+        # H_tot = N_br * N_sh. The mask is identical for all N_sh heads within a branch.
+        full_mask = branch_masks.unsqueeze(1).repeat(1, N_sh, 1, 1) # (N_br, N_sh, T, T)
+        full_mask = full_mask.view(1, H_tot, T, T) # Flatten branches/heads
+        
         sinks = self.sink_scalars.view(1, H_tot, 1, 1).expand(B, -1, T, -1)
-        sinks = torch.tanh(sinks)+1e-6 #gate this behavior to reasonable regimes
-        w = torch.cat([w, sinks], dim=-1)
-
-        alpha = (w.sum(dim=-1, keepdim=True) + 1e-6).reciprocal()
-        probs_full = w * alpha
-
-        # Split tokens vs sink mass
+        sinks = torch.tanh(sinks) 
+        
+        # Pass the generated mask to softmax
+        probs_full = self.softmax(q, k, sinks, mask=full_mask)
+        
         probs_tokens = probs_full[..., :T]   # (B, H_tot, T, T)
         probs_sink   = probs_full[..., T:]   # (B, H_tot, T, 1)
+        
         out_tokens = probs_tokens @ v
-
         v_null_expanded = self.v_nulls.view(1, H_tot, 1, Dh)
         out_sinks = probs_sink * v_null_expanded
 
@@ -130,7 +170,6 @@ class Attention(nn.Module):
         context = context.view(B, N_br, N_sh, T, Dh)
         context = context.permute(0, 1, 3, 2, 4).contiguous()  # (B, N_br, T, N_sh, Dh)
         context = context.view(B, N_br, T, C)                 # (B, N_br, T, C)
-        
         # Apply shared output projection across branches
         context_flat = context.view(B * N_br * T, C)
         y_flat = self.W_O(context_flat)
